@@ -32,6 +32,8 @@ use {
     rocksdb::{
         ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType, Direction, IteratorMode,
         Options, WriteBatch,
+        compaction_filter::Decision as CompactionDecision,
+        compaction_filter_factory::{CompactionFilterContext, CompactionFilterFactory},
     },
     smallvec::SmallVec,
     solana_clock::Slot,
@@ -39,7 +41,10 @@ use {
     std::{
         borrow::Cow,
         collections::{BTreeMap, VecDeque},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
         thread,
         time::Duration,
     },
@@ -133,11 +138,51 @@ impl SlotIndexValue {
     }
 }
 
+/// Drops keys below a threshold during compaction — no tombstones needed.
+struct MessageCleanupFilterFactory {
+    cleanup_before: Arc<AtomicU64>,
+}
+
+struct MessageCleanupFilter {
+    cleanup_before: u64,
+}
+
+impl CompactionFilterFactory for MessageCleanupFilterFactory {
+    type Filter = MessageCleanupFilter;
+
+    fn create(&mut self, _context: CompactionFilterContext) -> Self::Filter {
+        MessageCleanupFilter {
+            cleanup_before: self.cleanup_before.load(Ordering::Relaxed),
+        }
+    }
+
+    fn name(&self) -> &std::ffi::CStr {
+        c"MessageCleanupFilterFactory"
+    }
+}
+
+impl rocksdb::compaction_filter::CompactionFilter for MessageCleanupFilter {
+    fn filter(&mut self, _level: u32, key: &[u8], _value: &[u8]) -> CompactionDecision {
+        if key.len() == 8 {
+            let index = u64::from_be_bytes(key.try_into().unwrap());
+            if index < self.cleanup_before {
+                return CompactionDecision::Remove;
+            }
+        }
+        CompactionDecision::Keep
+    }
+
+    fn name(&self) -> &std::ffi::CStr {
+        c"MessageCleanupFilter"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Storage {
     db: Arc<DB>,
     write_tx: kanal::Sender<WriteRequest>,
     replay_queue: Arc<Mutex<ReplayQueue>>,
+    cleanup_before: Arc<AtomicU64>,
 }
 
 impl Storage {
@@ -147,7 +192,9 @@ impl Storage {
         shutdown: CancellationToken,
     ) -> anyhow::Result<(Self, SpawnedThreads)> {
         let db_options = Self::get_db_options();
-        let cf_descriptors = Self::cf_descriptors(config.messages_compression.into());
+        let cleanup_before = Arc::new(AtomicU64::new(0));
+        let cf_descriptors =
+            Self::cf_descriptors(config.messages_compression.into(), Arc::clone(&cleanup_before));
 
         let db = Arc::new(
             DB::open_cf_descriptors(&db_options, &config.path, cf_descriptors)
@@ -162,6 +209,7 @@ impl Storage {
             db: Arc::clone(&db),
             write_tx: ser_tx,
             replay_queue: Arc::clone(&replay_queue),
+            cleanup_before,
         };
 
         let mut threads = vec![];
@@ -271,9 +319,15 @@ impl Storage {
         options
     }
 
-    fn cf_descriptors(message_compression: DBCompressionType) -> Vec<ColumnFamilyDescriptor> {
+    fn cf_descriptors(
+        message_compression: DBCompressionType,
+        cleanup_before: Arc<AtomicU64>,
+    ) -> Vec<ColumnFamilyDescriptor> {
+        let mut msg_opts = Self::get_cf_options(message_compression);
+        msg_opts.set_compaction_filter_factory(MessageCleanupFilterFactory { cleanup_before });
+
         vec![
-            Self::cf_descriptor::<MessageIndex>(message_compression),
+            ColumnFamilyDescriptor::new(MessageIndex::NAME, msg_opts),
             Self::cf_descriptor::<SlotIndex>(DBCompressionType::None),
         ]
     }
@@ -347,26 +401,8 @@ impl Storage {
                     counter!(CHANNEL_STORAGE_WRITE_SER_INDEX).absolute(index);
                     gindex = index;
                 }
-                WriteRequest::RemoveReplay { slot, from, until } => {
+                WriteRequest::RemoveSlot { slot } => {
                     batch.delete_cf(Self::cf_handle::<SlotIndex>(&db), SlotIndex::encode(slot));
-                    if let Some(until) = until {
-                        let begin_key = MessageIndex::encode(from.unwrap_or(0));
-                        let end_key = MessageIndex::encode(until);
-
-                        // Drop whole SST files in range — no tombstones, instant space reclaim
-                        let _ = db.delete_file_in_range_cf(
-                            Self::cf_handle::<MessageIndex>(&db),
-                            &begin_key,
-                            &end_key,
-                        );
-
-                        // Range delete for remaining partial files at boundaries
-                        batch.delete_range_cf(
-                            Self::cf_handle::<MessageIndex>(&db),
-                            begin_key,
-                            end_key,
-                        );
-                    }
                 }
             }
 
@@ -593,10 +629,16 @@ impl Storage {
         });
     }
 
-    pub fn remove_replay(&self, slot: Slot, from: Option<u64>, until: Option<u64>) {
+    pub fn remove_replay(&self, slot: Slot, until: Option<u64>) {
+        // Update the compaction filter threshold — old keys will be dropped during
+        // natural compaction without creating any tombstones
+        if let Some(until) = until {
+            self.cleanup_before.fetch_max(until, Ordering::Relaxed);
+        }
+        // Delete the slot index entry via the write path
         let _ = self
             .write_tx
-            .send(WriteRequest::RemoveReplay { slot, from, until });
+            .send(WriteRequest::RemoveSlot { slot });
     }
 
     pub fn read_slots(&self) -> anyhow::Result<BTreeMap<Slot, SlotIndexValue>> {
@@ -660,10 +702,8 @@ enum WriteRequest {
         index: u64,
         message: ParsedMessage,
     },
-    RemoveReplay {
+    RemoveSlot {
         slot: Slot,
-        from: Option<u64>,
-        until: Option<u64>,
     },
 }
 
