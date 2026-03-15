@@ -372,10 +372,11 @@ impl Storage {
                 .set(elapsed.as_secs_f64());
             gauge!(CHANNEL_STORAGE_WRITE_BATCH_SIZE).set(batch_size as f64);
 
-            // RocksDB properties
+            // RocksDB properties (per column family — MessageIndex holds all the data)
+            let cf = Self::cf_handle::<MessageIndex>(&db);
             for level in 0..=6 {
                 if let Ok(Some(count)) =
-                    db.property_int_value(&format!("rocksdb.num-files-at-level{level}"))
+                    db.property_int_value_cf(cf, &format!("rocksdb.num-files-at-level{level}"))
                 {
                     gauge!(
                         CHANNEL_STORAGE_ROCKSDB_NUM_FILES_AT_LEVEL,
@@ -384,19 +385,19 @@ impl Storage {
                     .set(count as f64);
                 }
             }
-            if let Ok(Some(v)) = db.property_int_value("rocksdb.compaction-pending") {
+            if let Ok(Some(v)) = db.property_int_value_cf(cf, "rocksdb.compaction-pending") {
                 gauge!(CHANNEL_STORAGE_ROCKSDB_COMPACTION_PENDING).set(v as f64);
             }
             if let Ok(Some(v)) =
-                db.property_int_value("rocksdb.cur-size-all-mem-tables")
+                db.property_int_value_cf(cf, "rocksdb.cur-size-all-mem-tables")
             {
                 gauge!(CHANNEL_STORAGE_ROCKSDB_MEMTABLE_SIZE).set(v as f64);
             }
-            if let Ok(Some(v)) = db.property_int_value("rocksdb.live-sst-files-size") {
+            if let Ok(Some(v)) = db.property_int_value_cf(cf, "rocksdb.live-sst-files-size") {
                 gauge!(CHANNEL_STORAGE_ROCKSDB_LIVE_SST_FILES_SIZE).set(v as f64);
             }
             if let Ok(Some(v)) =
-                db.property_int_value("rocksdb.estimate-pending-compaction-bytes")
+                db.property_int_value_cf(cf, "rocksdb.estimate-pending-compaction-bytes")
             {
                 gauge!(CHANNEL_STORAGE_ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES)
                     .set(v as f64);
