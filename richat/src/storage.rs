@@ -252,7 +252,21 @@ impl Storage {
         options.set_max_bytes_for_level_base(total_size_base);
         options.set_target_file_size_base(file_size_base);
 
-        options.set_compression_type(compression);
+        // Raise L0 stall thresholds — defaults (20/36) are too low for this write-heavy workload
+        options.set_level_zero_slowdown_writes_trigger(64);
+        options.set_level_zero_stop_writes_trigger(128);
+
+        // Use lighter compression at lower levels where data is short-lived,
+        // only use heavy compression at deeper levels
+        options.set_compression_per_level(&[
+            DBCompressionType::None, // L0 — just flushed, will be compacted soon
+            DBCompressionType::None, // L1 — still hot
+            DBCompressionType::Lz4,  // L2
+            DBCompressionType::Lz4,  // L3
+            compression,             // L4
+            compression,             // L5
+            compression,             // L6
+        ]);
 
         options
     }
