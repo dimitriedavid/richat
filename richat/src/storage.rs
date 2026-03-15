@@ -4,7 +4,12 @@ use {
         config::ConfigStorage,
         grpc::server::SubscribeClient,
         metrics::{
-            CHANNEL_STORAGE_WRITE_INDEX, CHANNEL_STORAGE_WRITE_SER_INDEX,
+            CHANNEL_STORAGE_ROCKSDB_COMPACTION_PENDING,
+            CHANNEL_STORAGE_ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES,
+            CHANNEL_STORAGE_ROCKSDB_LIVE_SST_FILES_SIZE, CHANNEL_STORAGE_ROCKSDB_MEMTABLE_SIZE,
+            CHANNEL_STORAGE_ROCKSDB_NUM_FILES_AT_LEVEL, CHANNEL_STORAGE_WRITE_BATCH_SIZE,
+            CHANNEL_STORAGE_WRITE_DURATION_SECONDS, CHANNEL_STORAGE_WRITE_INDEX,
+            CHANNEL_STORAGE_WRITE_SER_BATCH_SIZE, CHANNEL_STORAGE_WRITE_SER_INDEX,
             CHANNEL_STORAGE_WRITE_SER_QUEUE_SIZE, GrpcSubscribeMessage,
         },
         util::SpawnedThreads,
@@ -341,6 +346,8 @@ impl Storage {
                 }
             }
 
+            gauge!(CHANNEL_STORAGE_WRITE_SER_BATCH_SIZE).set(batch.size_in_bytes() as f64);
+
             let mut opt = Some((gindex, batch));
             batch = match tx.try_send_option(&mut opt) {
                 Ok(true) => WriteBatch::new(),
@@ -355,8 +362,45 @@ impl Storage {
 
     fn spawn_write(db: Arc<DB>, rx: kanal::Receiver<(u64, WriteBatch)>) -> anyhow::Result<()> {
         while let Ok((index, batch)) = rx.recv() {
+            let batch_size = batch.size_in_bytes();
+            let ts = Instant::now();
             db.write(batch)?;
+            let elapsed = ts.elapsed();
+
             counter!(CHANNEL_STORAGE_WRITE_INDEX).absolute(index);
+            gauge!(CHANNEL_STORAGE_WRITE_DURATION_SECONDS)
+                .set(elapsed.as_secs_f64());
+            gauge!(CHANNEL_STORAGE_WRITE_BATCH_SIZE).set(batch_size as f64);
+
+            // RocksDB properties
+            for level in 0..=6 {
+                if let Ok(Some(count)) =
+                    db.property_int_value(&format!("rocksdb.num-files-at-level{level}"))
+                {
+                    gauge!(
+                        CHANNEL_STORAGE_ROCKSDB_NUM_FILES_AT_LEVEL,
+                        "level" => format!("{level}")
+                    )
+                    .set(count as f64);
+                }
+            }
+            if let Ok(Some(v)) = db.property_int_value("rocksdb.compaction-pending") {
+                gauge!(CHANNEL_STORAGE_ROCKSDB_COMPACTION_PENDING).set(v as f64);
+            }
+            if let Ok(Some(v)) =
+                db.property_int_value("rocksdb.cur-size-all-mem-tables")
+            {
+                gauge!(CHANNEL_STORAGE_ROCKSDB_MEMTABLE_SIZE).set(v as f64);
+            }
+            if let Ok(Some(v)) = db.property_int_value("rocksdb.live-sst-files-size") {
+                gauge!(CHANNEL_STORAGE_ROCKSDB_LIVE_SST_FILES_SIZE).set(v as f64);
+            }
+            if let Ok(Some(v)) =
+                db.property_int_value("rocksdb.estimate-pending-compaction-bytes")
+            {
+                gauge!(CHANNEL_STORAGE_ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES)
+                    .set(v as f64);
+            }
         }
         Ok(())
     }
