@@ -232,8 +232,8 @@ impl Storage {
     fn get_cf_options(compression: DBCompressionType) -> Options {
         let mut options = Options::default();
 
-        const MAX_WRITE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
-        options.set_max_write_buffer_number(8);
+        const MAX_WRITE_BUFFER_SIZE: u64 = 512 * 1024 * 1024;
+        options.set_max_write_buffer_number(16);
         options.set_write_buffer_size(MAX_WRITE_BUFFER_SIZE as usize);
 
         let file_num_compaction_trigger = 4;
@@ -323,14 +323,14 @@ impl Storage {
                     counter!(CHANNEL_STORAGE_WRITE_SER_INDEX).absolute(index);
                     gindex = index;
                 }
-                WriteRequest::RemoveReplay { slot, until } => {
+                WriteRequest::RemoveReplay { slot, from, until } => {
                     batch.delete_cf(Self::cf_handle::<SlotIndex>(&db), SlotIndex::encode(slot));
                     if let Some(until) = until {
                         // remove range `[begin_key, end_key)`
                         batch.delete_range_cf(
                             Self::cf_handle::<MessageIndex>(&db),
-                            MessageIndex::encode(0),     // begin_key
-                            MessageIndex::encode(until), // end_key
+                            MessageIndex::encode(from.unwrap_or(0)), // begin_key
+                            MessageIndex::encode(until),             // end_key
                         );
                     }
                 }
@@ -519,10 +519,10 @@ impl Storage {
         });
     }
 
-    pub fn remove_replay(&self, slot: Slot, until: Option<u64>) {
+    pub fn remove_replay(&self, slot: Slot, from: Option<u64>, until: Option<u64>) {
         let _ = self
             .write_tx
-            .send(WriteRequest::RemoveReplay { slot, until });
+            .send(WriteRequest::RemoveReplay { slot, from, until });
     }
 
     pub fn read_slots(&self) -> anyhow::Result<BTreeMap<Slot, SlotIndexValue>> {
@@ -588,6 +588,7 @@ enum WriteRequest {
     },
     RemoveReplay {
         slot: Slot,
+        from: Option<u64>,
         until: Option<u64>,
     },
 }

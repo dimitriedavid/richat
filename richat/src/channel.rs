@@ -354,6 +354,7 @@ impl Messages {
             global_replay_from_slot: global_replay_from_slot.clone(),
             storage: self.storage.clone(),
             storage_max_slots: self.storage_max_slots,
+            storage_last_cleaned: None,
             hasher,
             replay,
             index,
@@ -500,6 +501,7 @@ pub struct Sender {
     global_replay_from_slot: GlobalReplayFromSlot,
     storage: Option<Storage>,
     storage_max_slots: usize,
+    storage_last_cleaned: Option<u64>,
     index: u64,
     hasher: RandomState,
     replay: Arc<Mutex<BTreeMap<Slot, ReplayInfo>>>,
@@ -748,7 +750,14 @@ impl Sender {
                             .map(|replay| replay.head)
                             .min();
 
-                        storage.remove_replay(slot, until);
+                        storage.remove_replay(
+                            slot,
+                            self.storage_last_cleaned,
+                            until,
+                        );
+                        if let Some(until) = until {
+                            self.storage_last_cleaned = Some(until);
+                        }
                     }
                 }
             }
