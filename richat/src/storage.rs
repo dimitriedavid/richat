@@ -4,11 +4,12 @@ use {
         config::ConfigStorage,
         grpc::server::SubscribeClient,
         metrics::{
-            CHANNEL_STORAGE_WRITE_INDEX, CHANNEL_STORAGE_WRITE_SER_INDEX, GrpcSubscribeMessage,
+            CHANNEL_STORAGE_WRITE_INDEX, CHANNEL_STORAGE_WRITE_SER_INDEX,
+            CHANNEL_STORAGE_WRITE_SER_QUEUE_SIZE, GrpcSubscribeMessage,
         },
         util::SpawnedThreads,
     },
-    ::metrics::{Gauge, counter},
+    ::metrics::{Gauge, counter, gauge},
     anyhow::Context,
     hyper::body::Buf,
     prost::{
@@ -220,6 +221,9 @@ impl Storage {
         options.create_if_missing(true);
         options.create_missing_column_families(true);
 
+        // Enable pipelined write to improve write throughput
+        options.set_enable_pipelined_write(true);
+
         // Set_max_background_jobs(N), configures N/4 low priority threads and 3N/4 high priority threads
         options.set_max_background_jobs(num_cpus::get() as i32);
 
@@ -274,6 +278,7 @@ impl Storage {
         let mut batch = WriteBatch::new();
 
         while let Ok(message) = rx.recv() {
+            gauge!(CHANNEL_STORAGE_WRITE_SER_QUEUE_SIZE).set(rx.len() as f64);
             match message {
                 WriteRequest::PushMessage {
                     init,

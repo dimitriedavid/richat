@@ -27,6 +27,7 @@ pub const CHANNEL_MESSAGES_TOTAL: &str = "channel_messages_total";
 pub const CHANNEL_SLOTS_TOTAL: &str = "channel_slots_total";
 pub const CHANNEL_BYTES_TOTAL: &str = "channel_bytes_total";
 pub const CHANNEL_STORAGE_WRITE_SER_INDEX: &str = "channel_storage_write_ser_index";
+pub const CHANNEL_STORAGE_WRITE_SER_QUEUE_SIZE: &str = "channel_storage_write_ser_queue_size";
 pub const CHANNEL_STORAGE_WRITE_INDEX: &str = "channel_storage_write_index";
 pub const CHANNEL_STORAGE_SLOTS_TOTAL: &str = "channel_storage_slots_total";
 pub const GRPC_BLOCK_META_SLOT: &str = "grpc_block_meta_slot"; // commitment
@@ -74,6 +75,10 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
     describe_counter!(
         CHANNEL_STORAGE_WRITE_SER_INDEX,
         "Storage write serialize index"
+    );
+    describe_gauge!(
+        CHANNEL_STORAGE_WRITE_SER_QUEUE_SIZE,
+        "Number of pending messages in storage serialization queue"
     );
     describe_counter!(CHANNEL_STORAGE_WRITE_INDEX, "Storage write index");
     describe_gauge!(
