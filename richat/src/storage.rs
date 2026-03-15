@@ -350,11 +350,21 @@ impl Storage {
                 WriteRequest::RemoveReplay { slot, from, until } => {
                     batch.delete_cf(Self::cf_handle::<SlotIndex>(&db), SlotIndex::encode(slot));
                     if let Some(until) = until {
-                        // remove range `[begin_key, end_key)`
+                        let begin_key = MessageIndex::encode(from.unwrap_or(0));
+                        let end_key = MessageIndex::encode(until);
+
+                        // Drop whole SST files in range — no tombstones, instant space reclaim
+                        let _ = db.delete_file_in_range_cf(
+                            Self::cf_handle::<MessageIndex>(&db),
+                            &begin_key,
+                            &end_key,
+                        );
+
+                        // Range delete for remaining partial files at boundaries
                         batch.delete_range_cf(
                             Self::cf_handle::<MessageIndex>(&db),
-                            MessageIndex::encode(from.unwrap_or(0)), // begin_key
-                            MessageIndex::encode(until),             // end_key
+                            begin_key,
+                            end_key,
                         );
                     }
                 }
