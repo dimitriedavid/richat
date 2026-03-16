@@ -29,9 +29,16 @@ pub const CHANNEL_BYTES_TOTAL: &str = "channel_bytes_total";
 pub const CHANNEL_STORAGE_WRITE_SER_INDEX: &str = "channel_storage_write_ser_index";
 pub const CHANNEL_STORAGE_WRITE_INDEX: &str = "channel_storage_write_index";
 pub const CHANNEL_STORAGE_WRITE_SER_QUEUE_SIZE: &str = "channel_storage_write_ser_queue_size";
+pub const CHANNEL_STORAGE_WRITE_SER_QUEUE_BYTES: &str = "channel_storage_write_ser_queue_bytes";
 pub const CHANNEL_STORAGE_WRITE_SER_BATCH_SIZE: &str = "channel_storage_write_ser_batch_size";
 pub const CHANNEL_STORAGE_WRITE_DURATION_SECONDS: &str = "channel_storage_write_duration_seconds";
 pub const CHANNEL_STORAGE_WRITE_BATCH_SIZE: &str = "channel_storage_write_batch_size";
+pub const CHANNEL_STORAGE_TRIM_FROM_INDEX: &str = "channel_storage_trim_from_index";
+pub const CHANNEL_STORAGE_TRIM_TO_INDEX: &str = "channel_storage_trim_to_index";
+pub const CHANNEL_STORAGE_TRIM_SLOTS: &str = "channel_storage_trim_slots";
+pub const CHANNEL_STORAGE_TRIM_REQUESTS_TOTAL: &str = "channel_storage_trim_requests_total";
+pub const CHANNEL_STORAGE_TRIM_REQUESTS_MERGED_TOTAL: &str =
+    "channel_storage_trim_requests_merged_total";
 pub const CHANNEL_STORAGE_ROCKSDB_NUM_FILES_AT_LEVEL: &str =
     "channel_storage_rocksdb_num_files_at_level";
 pub const CHANNEL_STORAGE_ROCKSDB_COMPACTION_PENDING: &str =
@@ -94,6 +101,10 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
         "Number of pending messages in storage serialization queue"
     );
     describe_gauge!(
+        CHANNEL_STORAGE_WRITE_SER_QUEUE_BYTES,
+        "Approximate bytes reserved by the storage serialization queue"
+    );
+    describe_gauge!(
         CHANNEL_STORAGE_WRITE_SER_BATCH_SIZE,
         "Current WriteBatch data size in serialization thread"
     );
@@ -105,6 +116,26 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
     describe_gauge!(
         CHANNEL_STORAGE_WRITE_BATCH_SIZE,
         "Size of last WriteBatch written to RocksDB"
+    );
+    describe_gauge!(
+        CHANNEL_STORAGE_TRIM_FROM_INDEX,
+        "Inclusive replay index for the last applied storage trim"
+    );
+    describe_gauge!(
+        CHANNEL_STORAGE_TRIM_TO_INDEX,
+        "Exclusive replay index for the last applied storage trim"
+    );
+    describe_gauge!(
+        CHANNEL_STORAGE_TRIM_SLOTS,
+        "Number of slots removed by the last applied storage trim"
+    );
+    describe_counter!(
+        CHANNEL_STORAGE_TRIM_REQUESTS_TOTAL,
+        "Total number of requested storage trims"
+    );
+    describe_counter!(
+        CHANNEL_STORAGE_TRIM_REQUESTS_MERGED_TOTAL,
+        "Number of storage trim requests merged before write"
     );
     describe_gauge!(
         CHANNEL_STORAGE_ROCKSDB_NUM_FILES_AT_LEVEL,

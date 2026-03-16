@@ -240,6 +240,7 @@ pub struct Messages {
     parser: MessageParserEncoding,
     storage: Option<Storage>,
     storage_max_slots: usize,
+    storage_trim_slack_slots: usize,
     replay_info: Option<Arc<Mutex<BTreeMap<Slot, ReplayInfo>>>>,
 }
 
@@ -256,6 +257,11 @@ impl Messages {
             .storage
             .as_ref()
             .map(|config| config.max_slots)
+            .unwrap_or_default();
+        let storage_trim_slack_slots = config
+            .storage
+            .as_ref()
+            .map(|config| config.trim_slack_slots)
             .unwrap_or_default();
         let (storage, threads) = match config
             .storage
@@ -278,6 +284,7 @@ impl Messages {
             parser,
             storage,
             storage_max_slots,
+            storage_trim_slack_slots,
             replay_info: None,
         };
         Ok((messages, threads))
@@ -354,6 +361,7 @@ impl Messages {
             global_replay_from_slot: global_replay_from_slot.clone(),
             storage: self.storage.clone(),
             storage_max_slots: self.storage_max_slots,
+            storage_trim_slack_slots: self.storage_trim_slack_slots,
             hasher,
             replay,
             index,
@@ -500,6 +508,7 @@ pub struct Sender {
     global_replay_from_slot: GlobalReplayFromSlot,
     storage: Option<Storage>,
     storage_max_slots: usize,
+    storage_trim_slack_slots: usize,
     index: u64,
     hasher: RandomState,
     replay: Arc<Mutex<BTreeMap<Slot, ReplayInfo>>>,
@@ -739,17 +748,25 @@ impl Sender {
                     _ => break,
                 }
             }
-            while replay_lock.len() > self.storage_max_slots {
-                if let Some((slot, _replay)) = replay_lock.pop_first() {
-                    if let Some(storage) = &self.storage {
-                        let until = replay_lock
-                            .values()
-                            .take(300)
-                            .map(|replay| replay.head)
-                            .min();
-
-                        storage.remove_replay(slot, until);
+            let trim_trigger = self
+                .storage_max_slots
+                .saturating_add(self.storage_trim_slack_slots);
+            if replay_lock.len() > trim_trigger {
+                let trim_from = replay_lock
+                    .first_key_value()
+                    .map(|(_slot, replay)| replay.head);
+                let mut removed_slots = Vec::new();
+                while replay_lock.len() > self.storage_max_slots {
+                    if let Some((slot, _replay)) = replay_lock.pop_first() {
+                        removed_slots.push(slot);
                     }
+                }
+                if let (Some(storage), Some(index_from)) = (&self.storage, trim_from) {
+                    let index_to = replay_lock
+                        .first_key_value()
+                        .map(|(_slot, replay)| replay.head)
+                        .unwrap_or(self.index);
+                    storage.trim_replay(removed_slots, index_from, index_to);
                 }
             }
         }

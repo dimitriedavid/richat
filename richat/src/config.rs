@@ -246,6 +246,73 @@ pub struct ConfigStorage {
     pub write_affinity: Option<Vec<usize>>,
     #[serde(default)]
     pub messages_compression: ConfigStorageRocksdbCompression,
+    #[serde(default)]
+    pub messages_hot_compression: Option<ConfigStorageRocksdbCompression>,
+    #[serde(
+        default = "ConfigStorage::default_trim_slack_slots",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub trim_slack_slots: usize,
+    #[serde(
+        default = "ConfigStorage::default_max_ingest_queue_bytes",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub max_ingest_queue_bytes: usize,
+    #[serde(
+        default = "ConfigStorage::default_max_write_batch_bytes",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub max_write_batch_bytes: usize,
+    #[serde(
+        with = "humantime_serde",
+        default = "ConfigStorage::default_max_write_batch_delay"
+    )]
+    pub max_write_batch_delay: Duration,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_max_total_wal_size",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub rocksdb_max_total_wal_size: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_write_buffer_size",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub rocksdb_message_write_buffer_size: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_max_write_buffer_number",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub rocksdb_message_max_write_buffer_number: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_l0_file_num_compaction_trigger",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub rocksdb_message_l0_file_num_compaction_trigger: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_target_file_size_base",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub rocksdb_message_target_file_size_base: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_max_bytes_for_level_base",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub rocksdb_message_max_bytes_for_level_base: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_max_subcompactions",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub rocksdb_message_max_subcompactions: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_bytes_per_sync",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub rocksdb_message_bytes_per_sync: usize,
+    #[serde(
+        default = "ConfigStorage::default_rocksdb_message_wal_bytes_per_sync",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    pub rocksdb_message_wal_bytes_per_sync: usize,
     #[serde(
         default = "ConfigStorage::default_replay_channel_capacity",
         deserialize_with = "deserialize_num_str"
@@ -270,6 +337,58 @@ impl ConfigStorage {
         1024
     }
 
+    const fn default_trim_slack_slots() -> usize {
+        64
+    }
+
+    const fn default_max_ingest_queue_bytes() -> usize {
+        1024 * 1024 * 1024
+    }
+
+    const fn default_max_write_batch_bytes() -> usize {
+        128 * 1024 * 1024
+    }
+
+    const fn default_max_write_batch_delay() -> Duration {
+        Duration::from_millis(25)
+    }
+
+    const fn default_rocksdb_max_total_wal_size() -> usize {
+        32 * 1024 * 1024 * 1024
+    }
+
+    const fn default_rocksdb_message_write_buffer_size() -> usize {
+        1024 * 1024 * 1024
+    }
+
+    const fn default_rocksdb_message_max_write_buffer_number() -> usize {
+        6
+    }
+
+    const fn default_rocksdb_message_l0_file_num_compaction_trigger() -> usize {
+        8
+    }
+
+    const fn default_rocksdb_message_target_file_size_base() -> usize {
+        512 * 1024 * 1024
+    }
+
+    const fn default_rocksdb_message_max_bytes_for_level_base() -> usize {
+        8 * 1024 * 1024 * 1024
+    }
+
+    const fn default_rocksdb_message_max_subcompactions() -> usize {
+        8
+    }
+
+    const fn default_rocksdb_message_bytes_per_sync() -> usize {
+        8 * 1024 * 1024
+    }
+
+    const fn default_rocksdb_message_wal_bytes_per_sync() -> usize {
+        8 * 1024 * 1024
+    }
+
     const fn default_replay_channel_capacity() -> usize {
         1024
     }
@@ -281,9 +400,19 @@ impl ConfigStorage {
     const fn default_replay_decode_per_tick() -> usize {
         256
     }
+
+    pub const fn get_messages_hot_compression(&self) -> ConfigStorageRocksdbCompression {
+        match self.messages_hot_compression {
+            Some(compression) => compression,
+            None => match self.messages_compression {
+                ConfigStorageRocksdbCompression::Zstd => ConfigStorageRocksdbCompression::Lz4,
+                compression => compression,
+            },
+        }
+    }
 }
 
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "lowercase")]
 pub enum ConfigStorageRocksdbCompression {
     #[default]
