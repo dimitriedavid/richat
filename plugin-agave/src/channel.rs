@@ -27,6 +27,19 @@ use {
     },
 };
 
+struct PushMetrics {
+    slot: Slot,
+    /// 0=Processed, 1=Confirmed, 2=Rooted, 3=FirstShredReceived, 4=Completed, 5=CreatedBank, 6=Dead
+    /// None means this message is not a Slot message
+    slot_status: Option<i32>,
+    is_dead: bool,
+    is_processed: bool,
+    tail: u64,
+    head: u64,
+    slots_len: usize,
+    bytes_total: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Sender {
     shared: Arc<Shared>,
@@ -63,21 +76,17 @@ impl Sender {
     }
 
     pub fn push(&self, message: ProtobufMessage, encoder: ProtobufEncoder) {
-        // encode message
         let data = message.encode(encoder);
-
-        // acquire state lock
         let mut state = self.shared.state_lock();
-
-        self.push_msg(&mut state, message, data);
-
-        // notify receivers
+        let metrics = self.push_msg(&mut state, message, data);
         for waker in state.wakers.drain(..) {
             waker.wake();
         }
+        drop(state);
+        self.update_metrics(metrics);
     }
 
-    fn push_msg(&self, state: &mut MutexGuard<'_, State>, message: ProtobufMessage, data: Vec<u8>) {
+    fn push_msg(&self, state: &mut MutexGuard<'_, State>, message: ProtobufMessage, data: Vec<u8>) -> PushMetrics {
         let mut removed_max_slot = None;
 
         // bump current tail
@@ -142,24 +151,62 @@ impl Sender {
             }
         }
 
-        // update metrics
-        if let ProtobufMessage::Slot { status, .. } = message {
-            if !matches!(status, SlotStatus::Dead(_)) {
-                gauge!(&self.recorder, metrics::GEYSER_SLOT_STATUS, "status" => status.as_str())
-                    .set(slot as f64);
-            }
-            if *status == SlotStatus::Processed {
-                debug!(
-                    "new processed {slot} / {} messages / {} slots / {} bytes",
-                    state.tail - state.head,
-                    state.slots.len(),
-                    state.bytes_total
-                );
+        let (slot_status, is_dead, is_processed) = if let ProtobufMessage::Slot { status, .. } = &message {
+            let status_i32 = match **status {
+                SlotStatus::Processed           => 0,
+                SlotStatus::Confirmed           => 1,
+                SlotStatus::Rooted              => 2,
+                SlotStatus::FirstShredReceived  => 3,
+                SlotStatus::Completed           => 4,
+                SlotStatus::CreatedBank         => 5,
+                SlotStatus::Dead(_)             => 6,
+            };
+            let is_dead = matches!(**status, SlotStatus::Dead(_));
+            let is_processed = matches!(**status, SlotStatus::Processed);
+            (Some(status_i32), is_dead, is_processed)
+        } else {
+            (None, false, false)
+        };
 
+        PushMetrics {
+            slot,
+            slot_status,
+            is_dead,
+            is_processed,
+            tail: state.tail,
+            head: state.head,
+            slots_len: state.slots.len(),
+            bytes_total: state.bytes_total,
+        }
+    }
+
+    fn update_metrics(&self, m: PushMetrics) {
+        if let Some(status_i32) = m.slot_status {
+            let status_str = match status_i32 {
+                0 => "processed",
+                1 => "confirmed",
+                2 => "rooted",
+                3 => "first_shred_received",
+                4 => "completed",
+                5 => "created_bank",
+                _ => "dead",
+            };
+            if !m.is_dead {
+                gauge!(&self.recorder, metrics::GEYSER_SLOT_STATUS, "status" => status_str)
+                    .set(m.slot as f64);
+            }
+            if m.is_processed {
+                debug!(
+                    "new processed {} / {} messages / {} slots / {} bytes",
+                    m.slot,
+                    m.tail - m.head,
+                    m.slots_len,
+                    m.bytes_total
+                );
                 gauge!(&self.recorder, metrics::CHANNEL_MESSAGES_TOTAL)
-                    .set((state.tail - state.head) as f64);
-                gauge!(&self.recorder, metrics::CHANNEL_SLOTS_TOTAL).set(state.slots.len() as f64);
-                gauge!(&self.recorder, metrics::CHANNEL_BYTES_TOTAL).set(state.bytes_total as f64);
+                    .set((m.tail - m.head) as f64);
+                gauge!(&self.recorder, metrics::CHANNEL_SLOTS_TOTAL).set(m.slots_len as f64);
+                gauge!(&self.recorder, metrics::CHANNEL_BYTES_TOTAL).set(m.bytes_total as f64);
             }
         }
     }
