@@ -1,5 +1,4 @@
 use {
-    crate::protobuf::ProtobufEncoder,
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPluginError, Result as PluginResult,
     },
@@ -8,10 +7,7 @@ use {
         config::{ConfigTokio, deserialize_humansize_usize, deserialize_num_str},
         transports::{grpc::ConfigGrpcServer, quic::ConfigQuicServer},
     },
-    serde::{
-        Deserialize,
-        de::{self, Deserializer},
-    },
+    serde::Deserialize,
     std::{fs, path::Path},
 };
 
@@ -58,8 +54,6 @@ impl Default for ConfigLogs {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigChannel {
-    #[serde(deserialize_with = "ConfigChannel::deserialize_encoder")]
-    pub encoder: ProtobufEncoder,
     #[serde(deserialize_with = "deserialize_num_str")]
     pub max_messages: usize,
     #[serde(deserialize_with = "deserialize_humansize_usize")]
@@ -69,24 +63,8 @@ pub struct ConfigChannel {
 impl Default for ConfigChannel {
     fn default() -> Self {
         Self {
-            encoder: ProtobufEncoder::Raw,
             max_messages: 2_097_152, // aligned to power of 2, ~20k/slot should give us ~100 slots
             max_bytes: 15 * 1024 * 1024 * 1024, // 15GiB with ~150MiB/slot should give us ~100 slots
-        }
-    }
-}
-
-impl ConfigChannel {
-    pub fn deserialize_encoder<'de, D>(deserializer: D) -> Result<ProtobufEncoder, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match Deserialize::deserialize(deserializer)? {
-            "prost" => Ok(ProtobufEncoder::Prost),
-            "raw" => Ok(ProtobufEncoder::Raw),
-            value => Err(de::Error::custom(format!(
-                "failed to decode encoder: {value}"
-            ))),
         }
     }
 }
