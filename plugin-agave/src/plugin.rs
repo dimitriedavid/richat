@@ -438,6 +438,252 @@ impl GeyserPlugin for Plugin {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use {
+        super::{OwnedUpdate, PluginNotification},
+        agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
+        prost::Message,
+        prost_types::Timestamp,
+        richat_benches::fixtures::{
+            generate_accounts, generate_block_metas, generate_entries, generate_slots,
+            generate_transactions,
+        },
+        richat_proto::{
+            convert_to,
+            geyser::{
+                SlotStatus as ProtoSlotStatus, SubscribeUpdate, SubscribeUpdateAccount,
+                SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
+                SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+                subscribe_update::UpdateOneof,
+            },
+        },
+        std::time::SystemTime,
+    };
+
+    fn encode_owned(payload: UpdateOneof, created_at: SystemTime) -> Vec<u8> {
+        SubscribeUpdate {
+            filters: vec![],
+            update_oneof: Some(payload),
+            created_at: Some(Timestamp::from(created_at)),
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn test_encode_account() {
+        let created_at = SystemTime::now();
+        for item in generate_accounts() {
+            let (slot, replica) = item.to_replica();
+            let owned = OwnedUpdate {
+                notification: PluginNotification::Account,
+                created_at,
+                slot,
+                payload: UpdateOneof::Account(SubscribeUpdateAccount {
+                    account: Some(SubscribeUpdateAccountInfo {
+                        pubkey: replica.pubkey.to_vec(),
+                        lamports: replica.lamports,
+                        owner: replica.owner.to_vec(),
+                        executable: replica.executable,
+                        rent_epoch: replica.rent_epoch,
+                        data: replica.data.to_vec(),
+                        write_version: replica.write_version,
+                        txn_signature: replica
+                            .txn
+                            .as_ref()
+                            .map(|txn| txn.signature().as_ref().to_vec()),
+                    }),
+                    slot,
+                    is_startup: false,
+                }),
+                slot_status_i32: 0,
+                slot_confirmed: false,
+                slot_finalized: false,
+            };
+            let expected = SubscribeUpdate {
+                filters: vec![],
+                update_oneof: Some(UpdateOneof::Account(item.to_prost())),
+                created_at: Some(Timestamp::from(created_at)),
+            }
+            .encode_to_vec();
+            assert_eq!(
+                encode_owned(owned.payload, created_at),
+                expected,
+                "account: {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_transaction() {
+        let created_at = SystemTime::now();
+        for item in generate_transactions() {
+            let (slot, replica) = item.to_replica();
+            let owned = OwnedUpdate {
+                notification: PluginNotification::Transaction,
+                created_at,
+                slot,
+                payload: UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                    transaction: Some(SubscribeUpdateTransactionInfo {
+                        signature: replica.signature.as_ref().to_vec(),
+                        is_vote: replica.is_vote,
+                        transaction: Some(convert_to::create_transaction(replica.transaction)),
+                        meta: Some(convert_to::create_transaction_meta(
+                            replica.transaction_status_meta,
+                        )),
+                        index: replica.index as u64,
+                    }),
+                    slot,
+                }),
+                slot_status_i32: 0,
+                slot_confirmed: false,
+                slot_finalized: false,
+            };
+            let expected = SubscribeUpdate {
+                filters: vec![],
+                update_oneof: Some(UpdateOneof::Transaction(item.to_prost())),
+                created_at: Some(Timestamp::from(created_at)),
+            }
+            .encode_to_vec();
+            assert_eq!(
+                encode_owned(owned.payload, created_at),
+                expected,
+                "transaction: {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_entry() {
+        let created_at = SystemTime::now();
+        for item in generate_entries() {
+            let replica = item.to_replica();
+            let owned = OwnedUpdate {
+                notification: PluginNotification::Entry,
+                created_at,
+                slot: replica.slot,
+                payload: UpdateOneof::Entry(SubscribeUpdateEntry {
+                    slot: replica.slot,
+                    index: replica.index as u64,
+                    num_hashes: replica.num_hashes,
+                    hash: replica.hash.to_vec(),
+                    executed_transaction_count: replica.executed_transaction_count,
+                    starting_transaction_index: replica.starting_transaction_index as u64,
+                }),
+                slot_status_i32: 0,
+                slot_confirmed: false,
+                slot_finalized: false,
+            };
+            let expected = SubscribeUpdate {
+                filters: vec![],
+                update_oneof: Some(UpdateOneof::Entry(item.to_prost())),
+                created_at: Some(Timestamp::from(created_at)),
+            }
+            .encode_to_vec();
+            assert_eq!(
+                encode_owned(owned.payload, created_at),
+                expected,
+                "entry: {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_slot() {
+        let created_at = SystemTime::now();
+        for item in generate_slots() {
+            let (slot, parent, status) = item.to_replica();
+            let (status_i32, confirmed, finalized) = match status {
+                SlotStatus::Processed           => (0i32, false, false),
+                SlotStatus::Confirmed           => (1,    true,  false),
+                SlotStatus::Rooted              => (2,    true,  true),
+                SlotStatus::FirstShredReceived  => (3,    false, false),
+                SlotStatus::Completed           => (4,    false, false),
+                SlotStatus::CreatedBank         => (5,    false, false),
+                SlotStatus::Dead(_)             => (6,    false, false),
+            };
+            let owned = OwnedUpdate {
+                notification: PluginNotification::Slot,
+                created_at,
+                slot,
+                payload: UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    parent,
+                    status: match status {
+                        SlotStatus::Processed           => ProtoSlotStatus::SlotProcessed,
+                        SlotStatus::Confirmed           => ProtoSlotStatus::SlotConfirmed,
+                        SlotStatus::Rooted              => ProtoSlotStatus::SlotFinalized,
+                        SlotStatus::FirstShredReceived  => ProtoSlotStatus::SlotFirstShredReceived,
+                        SlotStatus::Completed           => ProtoSlotStatus::SlotCompleted,
+                        SlotStatus::CreatedBank         => ProtoSlotStatus::SlotCreatedBank,
+                        SlotStatus::Dead(_)             => ProtoSlotStatus::SlotDead,
+                    } as i32,
+                    dead_error: if let SlotStatus::Dead(err) = status {
+                        Some(err.clone())
+                    } else {
+                        None
+                    },
+                }),
+                slot_status_i32: status_i32,
+                slot_confirmed: confirmed,
+                slot_finalized: finalized,
+            };
+            let expected = SubscribeUpdate {
+                filters: vec![],
+                update_oneof: Some(UpdateOneof::Slot(item.to_prost())),
+                created_at: Some(Timestamp::from(created_at)),
+            }
+            .encode_to_vec();
+            assert_eq!(
+                encode_owned(owned.payload, created_at),
+                expected,
+                "slot: {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_block_meta() {
+        let created_at = SystemTime::now();
+        for item in generate_block_metas() {
+            let replica = item.to_replica();
+            let owned = OwnedUpdate {
+                notification: PluginNotification::BlockMeta,
+                created_at,
+                slot: replica.slot,
+                payload: UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                    slot: replica.slot,
+                    blockhash: replica.blockhash.to_string(),
+                    rewards: Some(convert_to::create_rewards_obj(
+                        &replica.rewards.rewards,
+                        replica.rewards.num_partitions,
+                    )),
+                    block_time: replica.block_time.map(convert_to::create_timestamp),
+                    block_height: replica.block_height.map(convert_to::create_block_height),
+                    parent_slot: replica.parent_slot,
+                    parent_blockhash: replica.parent_blockhash.to_string(),
+                    executed_transaction_count: replica.executed_transaction_count,
+                    entries_count: replica.entry_count,
+                }),
+                slot_status_i32: 0,
+                slot_confirmed: false,
+                slot_finalized: false,
+            };
+            let expected = SubscribeUpdate {
+                filters: vec![],
+                update_oneof: Some(UpdateOneof::BlockMeta(item.to_prost())),
+                created_at: Some(Timestamp::from(created_at)),
+            }
+            .encode_to_vec();
+            assert_eq!(
+                encode_owned(owned.payload, created_at),
+                expected,
+                "block_meta: {item:?}"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "plugin")]
 #[unsafe(no_mangle)]
 #[allow(improper_ctypes_definitions)]
