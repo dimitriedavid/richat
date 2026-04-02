@@ -30,6 +30,18 @@ pub enum PluginNotification {
     BlockMeta,
 }
 
+impl PluginNotification {
+    pub const fn bit(self) -> u8 {
+        match self {
+            Self::Slot        => 1 << 0,
+            Self::Account     => 1 << 1,
+            Self::Transaction => 1 << 2,
+            Self::Entry       => 1 << 3,
+            Self::BlockMeta   => 1 << 4,
+        }
+    }
+}
+
 impl From<&ProtobufMessage<'_>> for PluginNotification {
     fn from(value: &ProtobufMessage<'_>) -> Self {
         match value {

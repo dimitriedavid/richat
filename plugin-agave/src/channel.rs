@@ -27,6 +27,31 @@ use {
     },
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationMask(u8);
+
+impl NotificationMask {
+    /// Slot and BlockMeta are always delivered — cannot be filtered by subscribers.
+    pub const ALWAYS_ON: Self = Self(
+        PluginNotification::Slot.bit() | PluginNotification::BlockMeta.bit(),
+    );
+
+    pub const fn for_notification(n: PluginNotification) -> Self {
+        Self(n.bit())
+    }
+
+    pub const fn matches(self, n: PluginNotification) -> bool {
+        self.0 & n.bit() != 0
+    }
+}
+
+impl std::ops::BitOr for NotificationMask {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
 struct PushMetrics {
     slot: Slot,
     /// 0=Processed, 1=Confirmed, 2=Rooted, 3=FirstShredReceived, 4=Completed, 5=CreatedBank, 6=Dead
@@ -77,13 +102,23 @@ impl Sender {
 
     pub fn push(&self, message: ProtobufMessage, encoder: ProtobufEncoder) {
         let data = message.encode(encoder);
+        let notification = PluginNotification::from(&message);
         let mut state = self.shared.state_lock();
         let metrics = self.push_msg(&mut state, message, data);
-        for waker in state.wakers.drain(..) {
-            waker.wake();
-        }
+        let mut to_wake: Vec<Waker> = Vec::new();
+        state.wakers.retain(|(mask, waker)| {
+            if mask.matches(notification) {
+                to_wake.push(waker.clone());
+                false
+            } else {
+                true
+            }
+        });
         drop(state);
         self.update_metrics(metrics);
+        for waker in to_wake {
+            waker.wake();
+        }
     }
 
     fn push_msg(&self, state: &mut MutexGuard<'_, State>, message: ProtobufMessage, data: Vec<u8>) -> PushMetrics {
@@ -217,7 +252,7 @@ impl Sender {
         }
 
         let mut state = self.shared.state_lock();
-        for waker in state.wakers.drain(..) {
+        for (_, waker) in state.wakers.drain(..) {
             waker.wake();
         }
     }
@@ -270,6 +305,20 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    fn notification_mask(&self) -> NotificationMask {
+        let mut mask = NotificationMask::ALWAYS_ON;
+        if self.enable_notifications_accounts {
+            mask = mask | NotificationMask::for_notification(PluginNotification::Account);
+        }
+        if self.enable_notifications_transactions {
+            mask = mask | NotificationMask::for_notification(PluginNotification::Transaction);
+        }
+        if self.enable_notifications_entries {
+            mask = mask | NotificationMask::for_notification(PluginNotification::Entry);
+        }
+        mask
+    }
+
     pub async fn recv(&mut self) -> Result<RecvItem, RecvError> {
         Recv::new(self).await
     }
@@ -297,7 +346,7 @@ impl Receiver {
                 }
                 if item.pos != self.next {
                     return if item.pos < self.next {
-                        state.wakers.push(waker.clone());
+                        state.wakers.push((self.notification_mask(), waker.clone()));
                         Ok(None)
                     } else {
                         Err(RecvError::Lagged)
@@ -400,7 +449,7 @@ struct State {
     slots: BTreeMap<Slot, SlotInfo>,
     bytes_total: usize,
     bytes_max: usize,
-    wakers: Vec<Waker>,
+    wakers: Vec<(NotificationMask, Waker)>,
 }
 
 struct SlotInfo {
@@ -414,4 +463,43 @@ struct Item {
     slot: Slot,
     data: Option<(PluginNotification, RecvItem)>,
     closed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_mask_matches_own_bit() {
+        for n in [
+            PluginNotification::Slot,
+            PluginNotification::Account,
+            PluginNotification::Transaction,
+            PluginNotification::Entry,
+            PluginNotification::BlockMeta,
+        ] {
+            let mask = NotificationMask::for_notification(n);
+            assert!(mask.matches(n), "{n:?} mask should match itself");
+        }
+    }
+
+    #[test]
+    fn notification_mask_does_not_match_other_bits() {
+        let txn_only = NotificationMask::for_notification(PluginNotification::Transaction);
+        assert!(!txn_only.matches(PluginNotification::Account));
+        assert!(!txn_only.matches(PluginNotification::Slot));
+        assert!(!txn_only.matches(PluginNotification::Entry));
+        assert!(!txn_only.matches(PluginNotification::BlockMeta));
+    }
+
+    #[test]
+    fn notification_mask_combined() {
+        let mask = NotificationMask::ALWAYS_ON
+            | NotificationMask::for_notification(PluginNotification::Transaction);
+        assert!(mask.matches(PluginNotification::Slot));
+        assert!(mask.matches(PluginNotification::BlockMeta));
+        assert!(mask.matches(PluginNotification::Transaction));
+        assert!(!mask.matches(PluginNotification::Account));
+        assert!(!mask.matches(PluginNotification::Entry));
+    }
 }
