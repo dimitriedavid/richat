@@ -84,7 +84,16 @@ async fn encoder_task(
                     created_at: Some(Timestamp::from(owned.created_at)),
                 }
                 .encode_to_vec();
-                sender.push_encoded(notification, slot, slot_status_i32, slot_confirmed, slot_finalized, Arc::new(bytes));
+                sender.push_encoded(
+                    notification,
+                    crate::channel::SlotMeta {
+                        slot,
+                        status_i32: slot_status_i32,
+                        confirmed: slot_confirmed,
+                        finalized: slot_finalized,
+                    },
+                    Arc::new(bytes),
+                );
             }
             _ = shutdown.cancelled() => break,
         }

@@ -50,6 +50,13 @@ impl std::ops::BitOr for NotificationMask {
     }
 }
 
+pub struct SlotMeta {
+    pub slot: Slot,
+    pub status_i32: i32,
+    pub confirmed: bool,
+    pub finalized: bool,
+}
+
 struct PushMetrics {
     slot: Slot,
     /// 0=Processed, 1=Confirmed, 2=Rooted, 3=FirstShredReceived, 4=Completed, 5=CreatedBank, 6=Dead
@@ -101,14 +108,11 @@ impl Sender {
     pub fn push_encoded(
         &self,
         notification: PluginNotification,
-        slot: Slot,
-        slot_status_i32: i32,
-        slot_confirmed: bool,
-        slot_finalized: bool,
+        slot_meta: SlotMeta,
         data: std::sync::Arc<Vec<u8>>,
     ) {
         let mut state = self.shared.state_lock();
-        let metrics = self.push_msg_encoded(&mut state, notification, slot, slot_status_i32, slot_confirmed, slot_finalized, data);
+        let metrics = self.push_msg_encoded(&mut state, notification, slot_meta, data);
         let mut to_wake: Vec<Waker> = Vec::new();
         state.wakers.retain(|(mask, waker)| {
             if mask.matches(notification) {
@@ -129,10 +133,7 @@ impl Sender {
         &self,
         state: &mut std::sync::MutexGuard<'_, State>,
         notification: PluginNotification,
-        slot: Slot,
-        slot_status_i32: i32,
-        slot_confirmed: bool,
-        slot_finalized: bool,
+        slot_meta: SlotMeta,
         data: std::sync::Arc<Vec<u8>>,
     ) -> PushMetrics {
         let mut removed_max_slot = None;
@@ -142,15 +143,15 @@ impl Sender {
 
         // update slots info
         let head = state.tail;
-        let entry = state.slots.entry(slot).or_insert_with(|| SlotInfo {
+        let entry = state.slots.entry(slot_meta.slot).or_insert_with(|| SlotInfo {
             head,
             confirmed: false,
             finalized: false,
         });
-        if slot_confirmed {
+        if slot_meta.confirmed {
             entry.confirmed = true;
         }
-        if slot_finalized {
+        if slot_meta.finalized {
             entry.finalized = true;
         }
 
@@ -164,7 +165,7 @@ impl Sender {
             removed_max_slot = Some(item.slot);
         }
         item.pos = state.tail;
-        item.slot = slot;
+        item.slot = slot_meta.slot;
         item.data = Some((notification, data));
         drop(item);
 
@@ -197,11 +198,11 @@ impl Sender {
         }
 
         let is_slot = matches!(notification, PluginNotification::Slot);
-        let is_dead = is_slot && slot_status_i32 == 6;
-        let is_processed = is_slot && slot_status_i32 == 0;
+        let is_dead = is_slot && slot_meta.status_i32 == 6;
+        let is_processed = is_slot && slot_meta.status_i32 == 0;
         PushMetrics {
-            slot,
-            slot_status: if is_slot { Some(slot_status_i32) } else { None },
+            slot: slot_meta.slot,
+            slot_status: if is_slot { Some(slot_meta.status_i32) } else { None },
             is_dead,
             is_processed,
             tail: state.tail,
