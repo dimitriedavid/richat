@@ -34,16 +34,8 @@ richat-shared = { workspace = true, features = ["transports", "version"] }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-solana-account-decoder = { workspace = true }
 solana-clock = { workspace = true }
 solana-logger = { workspace = true }
-solana-message = { workspace = true }
-solana-pubkey = { workspace = true }
-solana-signature = { workspace = true }
-solana-transaction = { workspace = true }
-solana-transaction-context = { workspace = true }
-solana-transaction-error = { workspace = true }
-solana-transaction-status = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tokio-util = { workspace = true }
 
