@@ -3,7 +3,6 @@ use {
         channel::Sender,
         config::Config,
         metrics,
-        protobuf::{ProtobufEncoder, ProtobufMessage},
         version::VERSION,
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
@@ -42,16 +41,15 @@ impl PluginNotification {
     }
 }
 
-impl From<&ProtobufMessage<'_>> for PluginNotification {
-    fn from(value: &ProtobufMessage<'_>) -> Self {
-        match value {
-            ProtobufMessage::Account { .. } => Self::Account,
-            ProtobufMessage::Slot { .. } => Self::Slot,
-            ProtobufMessage::Transaction { .. } => Self::Transaction,
-            ProtobufMessage::Entry { .. } => Self::Entry,
-            ProtobufMessage::BlockMeta { .. } => Self::BlockMeta,
-        }
-    }
+pub struct OwnedUpdate {
+    pub notification: PluginNotification,
+    pub created_at: std::time::SystemTime,
+    pub slot: solana_clock::Slot,
+    pub payload: richat_proto::geyser::subscribe_update::UpdateOneof,
+    /// Only meaningful when notification == Slot
+    pub slot_status_i32: i32,
+    pub slot_confirmed: bool,
+    pub slot_finalized: bool,
 }
 
 struct PluginTask(BoxFuture<'static, Result<(), JoinError>>);
@@ -64,11 +62,40 @@ impl fmt::Debug for PluginTask {
     }
 }
 
+async fn encoder_task(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<OwnedUpdate>,
+    sender: crate::channel::Sender,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use {prost::Message, prost_types::Timestamp, richat_proto::geyser::SubscribeUpdate, std::sync::Arc};
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(owned) = rx.recv() => {
+                let notification = owned.notification;
+                let slot = owned.slot;
+                let slot_status_i32 = owned.slot_status_i32;
+                let slot_confirmed = owned.slot_confirmed;
+                let slot_finalized = owned.slot_finalized;
+                let bytes = SubscribeUpdate {
+                    filters: vec![],
+                    update_oneof: Some(owned.payload),
+                    created_at: Some(Timestamp::from(owned.created_at)),
+                }
+                .encode_to_vec();
+                sender.push_encoded(notification, slot, slot_status_i32, slot_confirmed, slot_finalized, Arc::new(bytes));
+            }
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PluginInner {
     runtime: Runtime,
     messages: Sender,
-    encoder: ProtobufEncoder,
+    tx: tokio::sync::mpsc::UnboundedSender<OwnedUpdate>,
     shutdown: CancellationToken,
     tasks: Vec<(&'static str, PluginTask)>,
 }
@@ -93,10 +120,19 @@ impl PluginInner {
         let messages = Sender::new(config.channel, Arc::clone(&metrics_recorder));
 
         // Spawn servers
-        let (messages, shutdown, tasks) = runtime
+        let (messages, tx, shutdown, tasks) = runtime
             .block_on(async move {
                 let shutdown = CancellationToken::new();
                 let mut tasks = Vec::with_capacity(4);
+
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OwnedUpdate>();
+                let encoder_sender = messages.clone();
+                tasks.push((
+                    "Encoder Task",
+                    PluginTask(Box::pin(
+                        tokio::spawn(encoder_task(rx, encoder_sender, shutdown.clone()))
+                    )),
+                ));
 
                 // Start gRPC
                 if let Some(config) = config.grpc {
@@ -148,14 +184,14 @@ impl PluginInner {
                     ));
                 }
 
-                Ok::<_, anyhow::Error>((messages, shutdown, tasks))
+                Ok::<_, anyhow::Error>((messages, tx, shutdown, tasks))
             })
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
 
         Ok(Self {
             runtime,
             messages,
-            encoder: config.channel.encoder,
+            tx,
             shutdown,
             tasks,
         })
@@ -206,29 +242,39 @@ impl GeyserPlugin for Plugin {
         }
     }
 
-    fn update_account(
-        &self,
-        account: ReplicaAccountInfoVersions,
-        slot: u64,
-        is_startup: bool,
-    ) -> PluginResult<()> {
+    fn update_account(&self, account: ReplicaAccountInfoVersions, slot: u64, is_startup: bool) -> PluginResult<()> {
         if !is_startup {
             let account = match account {
-                ReplicaAccountInfoVersions::V0_0_1(_info) => {
-                    unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
-                }
-                ReplicaAccountInfoVersions::V0_0_2(_info) => {
-                    unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
-                }
+                ReplicaAccountInfoVersions::V0_0_1(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported"),
+                ReplicaAccountInfoVersions::V0_0_2(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported"),
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
-
             let inner = self.inner.as_ref().expect("initialized");
-            inner
-                .messages
-                .push(ProtobufMessage::Account { slot, account }, inner.encoder);
+            inner.tx.send(OwnedUpdate {
+                notification: PluginNotification::Account,
+                created_at: std::time::SystemTime::now(),
+                slot,
+                payload: richat_proto::geyser::subscribe_update::UpdateOneof::Account(
+                    richat_proto::geyser::SubscribeUpdateAccount {
+                        account: Some(richat_proto::geyser::SubscribeUpdateAccountInfo {
+                            pubkey: account.pubkey.to_vec(),
+                            lamports: account.lamports,
+                            owner: account.owner.to_vec(),
+                            executable: account.executable,
+                            rent_epoch: account.rent_epoch,
+                            data: account.data.to_vec(),
+                            write_version: account.write_version,
+                            txn_signature: account.txn.as_ref().map(|txn| txn.signature().as_ref().to_vec()),
+                        }),
+                        slot,
+                        is_startup: false,
+                    },
+                ),
+                slot_status_i32: 0,
+                slot_confirmed: false,
+                slot_finalized: false,
+            }).ok();
         }
-
         Ok(())
     }
 
@@ -242,16 +288,41 @@ impl GeyserPlugin for Plugin {
         parent: Option<u64>,
         status: &SlotStatus,
     ) -> PluginResult<()> {
+        use richat_proto::geyser::SlotStatus as ProtoSlotStatus;
+        let (status_i32, confirmed, finalized) = match status {
+            SlotStatus::Processed           => (0i32, false, false),
+            SlotStatus::Confirmed           => (1,    true,  false),
+            SlotStatus::Rooted              => (2,    true,  true),
+            SlotStatus::FirstShredReceived  => (3,    false, false),
+            SlotStatus::Completed           => (4,    false, false),
+            SlotStatus::CreatedBank         => (5,    false, false),
+            SlotStatus::Dead(_)             => (6,    false, false),
+        };
         let inner = self.inner.as_ref().expect("initialized");
-        inner.messages.push(
-            ProtobufMessage::Slot {
-                slot,
-                parent,
-                status,
-            },
-            inner.encoder,
-        );
-
+        inner.tx.send(OwnedUpdate {
+            notification: PluginNotification::Slot,
+            created_at: std::time::SystemTime::now(),
+            slot,
+            payload: richat_proto::geyser::subscribe_update::UpdateOneof::Slot(
+                richat_proto::geyser::SubscribeUpdateSlot {
+                    slot,
+                    parent,
+                    status: match status {
+                        SlotStatus::Processed           => ProtoSlotStatus::SlotProcessed,
+                        SlotStatus::Confirmed           => ProtoSlotStatus::SlotConfirmed,
+                        SlotStatus::Rooted              => ProtoSlotStatus::SlotFinalized,
+                        SlotStatus::FirstShredReceived  => ProtoSlotStatus::SlotFirstShredReceived,
+                        SlotStatus::Completed           => ProtoSlotStatus::SlotCompleted,
+                        SlotStatus::CreatedBank         => ProtoSlotStatus::SlotCreatedBank,
+                        SlotStatus::Dead(_)             => ProtoSlotStatus::SlotDead,
+                    } as i32,
+                    dead_error: if let SlotStatus::Dead(err) = status { Some(err.clone()) } else { None },
+                },
+            ),
+            slot_status_i32: status_i32,
+            slot_confirmed: confirmed,
+            slot_finalized: finalized,
+        }).ok();
         Ok(())
     }
 
@@ -260,61 +331,93 @@ impl GeyserPlugin for Plugin {
         transaction: ReplicaTransactionInfoVersions<'_>,
         slot: u64,
     ) -> PluginResult<()> {
+        use richat_proto::convert_to;
         let transaction = match transaction {
-            ReplicaTransactionInfoVersions::V0_0_1(_info) => {
-                unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
-            }
-            ReplicaTransactionInfoVersions::V0_0_2(_info) => {
-                unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
-            }
+            ReplicaTransactionInfoVersions::V0_0_1(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported"),
+            ReplicaTransactionInfoVersions::V0_0_2(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported"),
             ReplicaTransactionInfoVersions::V0_0_3(info) => info,
         };
-
         let inner = self.inner.as_ref().expect("initialized");
-        inner.messages.push(
-            ProtobufMessage::Transaction { slot, transaction },
-            inner.encoder,
-        );
-
+        inner.tx.send(OwnedUpdate {
+            notification: PluginNotification::Transaction,
+            created_at: std::time::SystemTime::now(),
+            slot,
+            payload: richat_proto::geyser::subscribe_update::UpdateOneof::Transaction(
+                richat_proto::geyser::SubscribeUpdateTransaction {
+                    transaction: Some(richat_proto::geyser::SubscribeUpdateTransactionInfo {
+                        signature: transaction.signature.as_ref().to_vec(),
+                        is_vote: transaction.is_vote,
+                        transaction: Some(convert_to::create_transaction(transaction.transaction)),
+                        meta: Some(convert_to::create_transaction_meta(transaction.transaction_status_meta)),
+                        index: transaction.index as u64,
+                    }),
+                    slot,
+                },
+            ),
+            slot_status_i32: 0,
+            slot_confirmed: false,
+            slot_finalized: false,
+        }).ok();
         Ok(())
     }
 
     fn notify_entry(&self, entry: ReplicaEntryInfoVersions) -> PluginResult<()> {
-        #[allow(clippy::infallible_destructuring_match)]
         let entry = match entry {
-            ReplicaEntryInfoVersions::V0_0_1(_entry) => {
-                unreachable!("ReplicaEntryInfoVersions::V0_0_1 is not supported")
-            }
-            ReplicaEntryInfoVersions::V0_0_2(entry) => entry,
+            ReplicaEntryInfoVersions::V0_0_1(_) => unreachable!("ReplicaEntryInfoVersions::V0_0_1 is not supported"),
+            ReplicaEntryInfoVersions::V0_0_2(e) => e,
         };
-
         let inner = self.inner.as_ref().expect("initialized");
-        inner
-            .messages
-            .push(ProtobufMessage::Entry { entry }, inner.encoder);
-
+        inner.tx.send(OwnedUpdate {
+            notification: PluginNotification::Entry,
+            created_at: std::time::SystemTime::now(),
+            slot: entry.slot,
+            payload: richat_proto::geyser::subscribe_update::UpdateOneof::Entry(
+                richat_proto::geyser::SubscribeUpdateEntry {
+                    slot: entry.slot,
+                    index: entry.index as u64,
+                    num_hashes: entry.num_hashes,
+                    hash: entry.hash.to_vec(),
+                    executed_transaction_count: entry.executed_transaction_count,
+                    starting_transaction_index: entry.starting_transaction_index as u64,
+                },
+            ),
+            slot_status_i32: 0,
+            slot_confirmed: false,
+            slot_finalized: false,
+        }).ok();
         Ok(())
     }
 
     fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions<'_>) -> PluginResult<()> {
+        use richat_proto::convert_to;
         let blockinfo = match blockinfo {
-            ReplicaBlockInfoVersions::V0_0_1(_info) => {
-                unreachable!("ReplicaBlockInfoVersions::V0_0_1 is not supported")
-            }
-            ReplicaBlockInfoVersions::V0_0_2(_info) => {
-                unreachable!("ReplicaBlockInfoVersions::V0_0_2 is not supported")
-            }
-            ReplicaBlockInfoVersions::V0_0_3(_info) => {
-                unreachable!("ReplicaBlockInfoVersions::V0_0_3 is not supported")
-            }
+            ReplicaBlockInfoVersions::V0_0_1(_) => unreachable!("ReplicaBlockInfoVersions::V0_0_1 is not supported"),
+            ReplicaBlockInfoVersions::V0_0_2(_) => unreachable!("ReplicaBlockInfoVersions::V0_0_2 is not supported"),
+            ReplicaBlockInfoVersions::V0_0_3(_) => unreachable!("ReplicaBlockInfoVersions::V0_0_3 is not supported"),
             ReplicaBlockInfoVersions::V0_0_4(info) => info,
         };
-
         let inner = self.inner.as_ref().expect("initialized");
-        inner
-            .messages
-            .push(ProtobufMessage::BlockMeta { blockinfo }, inner.encoder);
-
+        inner.tx.send(OwnedUpdate {
+            notification: PluginNotification::BlockMeta,
+            created_at: std::time::SystemTime::now(),
+            slot: blockinfo.slot,
+            payload: richat_proto::geyser::subscribe_update::UpdateOneof::BlockMeta(
+                richat_proto::geyser::SubscribeUpdateBlockMeta {
+                    slot: blockinfo.slot,
+                    blockhash: blockinfo.blockhash.to_string(),
+                    rewards: Some(convert_to::create_rewards_obj(&blockinfo.rewards.rewards, blockinfo.rewards.num_partitions)),
+                    block_time: blockinfo.block_time.map(convert_to::create_timestamp),
+                    block_height: blockinfo.block_height.map(convert_to::create_block_height),
+                    parent_slot: blockinfo.parent_slot,
+                    parent_blockhash: blockinfo.parent_blockhash.to_string(),
+                    executed_transaction_count: blockinfo.executed_transaction_count,
+                    entries_count: blockinfo.entry_count,
+                },
+            ),
+            slot_status_i32: 0,
+            slot_confirmed: false,
+            slot_finalized: false,
+        }).ok();
         Ok(())
     }
 

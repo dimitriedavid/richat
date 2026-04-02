@@ -4,9 +4,7 @@ use {
         config::ConfigChannel,
         metrics,
         plugin::PluginNotification,
-        protobuf::{ProtobufEncoder, ProtobufMessage},
     },
-    agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
     futures::stream::{Stream, StreamExt},
     log::debug,
     metrics_exporter_prometheus::PrometheusRecorder,
@@ -100,11 +98,17 @@ impl Sender {
         Self { shared, recorder }
     }
 
-    pub fn push(&self, message: ProtobufMessage, encoder: ProtobufEncoder) {
-        let data = message.encode(encoder);
-        let notification = PluginNotification::from(&message);
+    pub fn push_encoded(
+        &self,
+        notification: PluginNotification,
+        slot: Slot,
+        slot_status_i32: i32,
+        slot_confirmed: bool,
+        slot_finalized: bool,
+        data: std::sync::Arc<Vec<u8>>,
+    ) {
         let mut state = self.shared.state_lock();
-        let metrics = self.push_msg(&mut state, message, data);
+        let metrics = self.push_msg_encoded(&mut state, notification, slot, slot_status_i32, slot_confirmed, slot_finalized, data);
         let mut to_wake: Vec<Waker> = Vec::new();
         state.wakers.retain(|(mask, waker)| {
             if mask.matches(notification) {
@@ -121,54 +125,60 @@ impl Sender {
         }
     }
 
-    fn push_msg(&self, state: &mut MutexGuard<'_, State>, message: ProtobufMessage, data: Vec<u8>) -> PushMetrics {
+    fn push_msg_encoded(
+        &self,
+        state: &mut std::sync::MutexGuard<'_, State>,
+        notification: PluginNotification,
+        slot: Slot,
+        slot_status_i32: i32,
+        slot_confirmed: bool,
+        slot_finalized: bool,
+        data: std::sync::Arc<Vec<u8>>,
+    ) -> PushMetrics {
         let mut removed_max_slot = None;
 
         // bump current tail
         state.tail = state.tail.wrapping_add(1);
 
         // update slots info
-        let slot = message.get_slot();
         let head = state.tail;
         let entry = state.slots.entry(slot).or_insert_with(|| SlotInfo {
             head,
             confirmed: false,
             finalized: false,
         });
-        if let ProtobufMessage::Slot { parent: _, status, .. } = &message {
-            if **status == SlotStatus::Confirmed {
-                entry.confirmed = true;
-            } else if **status == SlotStatus::Rooted {
-                entry.finalized = true;
-            }
+        if slot_confirmed {
+            entry.confirmed = true;
+        }
+        if slot_finalized {
+            entry.finalized = true;
         }
 
         // lock and update item
         state.bytes_total += data.len();
         let idx = self.shared.get_idx(state.tail);
         let mut item = self.shared.buffer_idx(idx);
-        if let Some(message) = item.data.take() {
+        if let Some(evicted) = item.data.take() {
             state.head = state.head.wrapping_add(1);
-            state.bytes_total -= message.1.len();
+            state.bytes_total -= evicted.1.len();
             removed_max_slot = Some(item.slot);
         }
         item.pos = state.tail;
         item.slot = slot;
-        item.data = Some((PluginNotification::from(&message), Arc::new(data)));
+        item.data = Some((notification, data));
         drop(item);
 
         // drop extra messages by max bytes
         while state.bytes_total >= state.bytes_max && state.head < state.tail {
             let idx = self.shared.get_idx(state.head);
             let mut item = self.shared.buffer_idx(idx);
-            let Some(message) = item.data.take() else {
+            let Some(evicted) = item.data.take() else {
                 panic!("nothing to remove to keep bytes under limit")
             };
-
             state.head = state.head.wrapping_add(1);
-            state.bytes_total -= message.1.len();
+            state.bytes_total -= evicted.1.len();
             removed_max_slot = Some(match removed_max_slot {
-                Some(slot) => item.slot.max(slot),
+                Some(s) => item.slot.max(s),
                 None => item.slot,
             });
         }
@@ -177,35 +187,21 @@ impl Sender {
         if let Some(remove_upto) = removed_max_slot {
             loop {
                 match state.slots.first_key_value() {
-                    Some((slot, _)) if *slot <= remove_upto => {
-                        let slot = *slot;
-                        state.slots.remove(&slot);
+                    Some((s, _)) if *s <= remove_upto => {
+                        let s = *s;
+                        state.slots.remove(&s);
                     }
                     _ => break,
                 }
             }
         }
 
-        let (slot_status, is_dead, is_processed) = if let ProtobufMessage::Slot { status, .. } = &message {
-            let status_i32 = match **status {
-                SlotStatus::Processed           => 0,
-                SlotStatus::Confirmed           => 1,
-                SlotStatus::Rooted              => 2,
-                SlotStatus::FirstShredReceived  => 3,
-                SlotStatus::Completed           => 4,
-                SlotStatus::CreatedBank         => 5,
-                SlotStatus::Dead(_)             => 6,
-            };
-            let is_dead = matches!(**status, SlotStatus::Dead(_));
-            let is_processed = matches!(**status, SlotStatus::Processed);
-            (Some(status_i32), is_dead, is_processed)
-        } else {
-            (None, false, false)
-        };
-
+        let is_slot = matches!(notification, PluginNotification::Slot);
+        let is_dead = is_slot && slot_status_i32 == 6;
+        let is_processed = is_slot && slot_status_i32 == 0;
         PushMetrics {
             slot,
-            slot_status,
+            slot_status: if is_slot { Some(slot_status_i32) } else { None },
             is_dead,
             is_processed,
             tail: state.tail,
