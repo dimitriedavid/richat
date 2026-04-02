@@ -1,9 +1,5 @@
 use {
     crate::stream::handle_stream,
-    agave_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaEntryInfoV2, ReplicaTransactionInfoV3,
-        SlotStatus as GeyserSlotStatus,
-    },
     anyhow::Context,
     clap::{Args, Subcommand},
     futures::stream::{BoxStream, StreamExt, TryStreamExt},
@@ -14,20 +10,13 @@ use {
         grpc::GrpcClient,
         quic::{QuicClient, QuicClientBuilder},
     },
-    richat_plugin_agave::protobuf::{ProtobufEncoder, ProtobufMessage},
     richat_proto::{
-        convert_from,
-        geyser::{
-            SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateSlot,
-            SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
-        },
+        geyser::{SubscribeUpdate},
         richat::{GrpcSubscribeRequest, RichatFilter},
     },
     richat_shared::transports::{grpc::ConfigGrpcServer, quic::ConfigQuicServer},
     solana_clock::Slot,
-    solana_message::{LegacyMessage, Message, SanitizedMessage},
-    solana_transaction::sanitized::SanitizedTransaction,
-    std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration},
+    std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration},
     tonic::service::Interceptor,
     tracing::info,
 };
@@ -59,10 +48,6 @@ pub struct ArgsAppStreamRichat {
     #[clap(long)]
     x_token: Option<String>,
 
-    /// Do not verify messages with prost
-    #[clap(long)]
-    no_verify: bool,
-
     /// Show total stat instead of messages
     #[clap(long)]
     stats: bool,
@@ -92,29 +77,13 @@ impl ArgsAppStreamRichat {
     pub async fn run(self) -> anyhow::Result<()> {
         let pb_multi = Arc::new(MultiProgress::new());
         let replay_from_slot = self.replay_from_slot;
-        let verify = !self.no_verify;
         let stats = self.stats;
-        let pb_multi_stream = Arc::clone(&pb_multi);
         let stream = self
             .subscribe(replay_from_slot)
             .await?
-            .and_then(move |vec| {
-                let pb_multi_stream = Arc::clone(&pb_multi_stream);
-                async move {
-                    let msg = SubscribeUpdate::decode(vec.as_slice())?;
-                    if verify {
-                        match convert_prost_to_raw(&msg) {
-                            Ok(Some(vec_raw)) if vec != vec_raw => pb_multi_stream.println(
-                                format!("encoding doesn't match: {}", const_hex::encode(&vec)),
-                            ),
-                            Err(error) => pb_multi_stream
-                                .println(format!("failed to encode with raw: {error:?}")),
-                            _ => Ok(()),
-                        }
-                        .unwrap();
-                    }
-                    Ok(msg)
-                }
+            .and_then(move |vec| async move {
+                let msg = SubscribeUpdate::decode(vec.as_slice())?;
+                Ok(msg)
             })
             .boxed();
 
@@ -336,137 +305,3 @@ impl ArgsAppStreamGrpc {
     }
 }
 
-fn convert_prost_to_raw(msg: &SubscribeUpdate) -> anyhow::Result<Option<Vec<u8>>> {
-    let Some(created_at) = msg.created_at else {
-        return Ok(None);
-    };
-
-    Ok(Some(match &msg.update_oneof {
-        Some(UpdateOneof::Account(SubscribeUpdateAccount {
-            slot,
-            account: Some(account),
-            ..
-        })) => {
-            let txn = account
-                .txn_signature
-                .as_ref()
-                .map(|signature| {
-                    Ok::<_, anyhow::Error>(SanitizedTransaction::new_for_tests(
-                        SanitizedMessage::Legacy(LegacyMessage::new(
-                            Message::default(),
-                            &HashSet::new(),
-                        )),
-                        vec![signature.as_slice().try_into()?],
-                        false,
-                    ))
-                })
-                .transpose()
-                .context("failed to create txn")?;
-            let msg = ProtobufMessage::Account {
-                slot: *slot,
-                account: &ReplicaAccountInfoV3 {
-                    pubkey: account.pubkey.as_ref(),
-                    lamports: account.lamports,
-                    owner: account.owner.as_ref(),
-                    executable: account.executable,
-                    rent_epoch: account.rent_epoch,
-                    data: &account.data,
-                    write_version: account.write_version,
-                    txn: txn.as_ref(),
-                },
-            };
-            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
-        }
-        Some(UpdateOneof::Slot(SubscribeUpdateSlot {
-            slot,
-            parent,
-            status,
-            dead_error,
-        })) => {
-            let msg = ProtobufMessage::Slot {
-                slot: *slot,
-                parent: *parent,
-                status: &match SlotStatus::try_from(*status) {
-                    Ok(SlotStatus::SlotProcessed) => GeyserSlotStatus::Processed,
-                    Ok(SlotStatus::SlotConfirmed) => GeyserSlotStatus::Confirmed,
-                    Ok(SlotStatus::SlotFinalized) => GeyserSlotStatus::Rooted,
-                    Ok(SlotStatus::SlotFirstShredReceived) => GeyserSlotStatus::FirstShredReceived,
-                    Ok(SlotStatus::SlotCompleted) => GeyserSlotStatus::Completed,
-                    Ok(SlotStatus::SlotCreatedBank) => GeyserSlotStatus::CreatedBank,
-                    Ok(SlotStatus::SlotDead) => {
-                        GeyserSlotStatus::Dead(dead_error.clone().unwrap_or_default())
-                    }
-                    Err(value) => anyhow::bail!("invalid status: {value}"),
-                },
-            };
-            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
-        }
-        Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
-            transaction: Some(tx),
-            slot,
-        })) => {
-            let value = tx
-                .transaction
-                .clone()
-                .ok_or(anyhow::anyhow!("no tx message"))?;
-            let versioned_transaction =
-                convert_from::create_tx_versioned(value).map_err(|error| anyhow::anyhow!(error))?;
-
-            let value = tx.meta.clone().ok_or(anyhow::anyhow!("no meta message"))?;
-            let transaction_status_meta =
-                convert_from::create_tx_meta(value).map_err(|error| anyhow::anyhow!(error))?;
-
-            let msg = ProtobufMessage::Transaction {
-                slot: *slot,
-                transaction: &ReplicaTransactionInfoV3 {
-                    signature: &tx
-                        .signature
-                        .as_slice()
-                        .try_into()
-                        .context("failed to create signature")?,
-                    message_hash: &versioned_transaction.message.hash(),
-                    is_vote: tx.is_vote,
-                    transaction: &versioned_transaction,
-                    transaction_status_meta: &transaction_status_meta,
-                    index: tx.index as usize,
-                },
-            };
-            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
-        }
-        Some(UpdateOneof::Entry(entry)) => {
-            let msg = ProtobufMessage::Entry {
-                entry: &ReplicaEntryInfoV2 {
-                    slot: entry.slot,
-                    index: entry.index as usize,
-                    num_hashes: entry.num_hashes,
-                    hash: entry.hash.as_ref(),
-                    executed_transaction_count: entry.executed_transaction_count,
-                    starting_transaction_index: entry.starting_transaction_index as usize,
-                },
-            };
-            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
-        }
-        Some(UpdateOneof::BlockMeta(meta)) => {
-            let msg = ProtobufMessage::BlockMeta {
-                blockinfo: &ReplicaBlockInfoV4 {
-                    parent_slot: meta.parent_slot,
-                    slot: meta.slot,
-                    parent_blockhash: &meta.parent_blockhash,
-                    blockhash: &meta.blockhash,
-                    rewards: &convert_from::create_rewards_obj(
-                        meta.rewards
-                            .clone()
-                            .ok_or(anyhow::anyhow!("no rewards message"))?,
-                    )
-                    .map_err(|error| anyhow::anyhow!(error))?,
-                    block_time: meta.block_time.map(|b| b.timestamp),
-                    block_height: meta.block_height.map(|b| b.block_height),
-                    executed_transaction_count: meta.executed_transaction_count,
-                    entry_count: meta.entries_count,
-                },
-            };
-            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
-        }
-        _ => return Ok(None),
-    }))
-}
