@@ -34,7 +34,6 @@ richat-shared = { workspace = true, features = ["transports", "version"] }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-smallvec = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-clock = { workspace = true }
 solana-logger = { workspace = true }
