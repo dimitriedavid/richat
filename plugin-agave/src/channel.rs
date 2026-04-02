@@ -113,7 +113,7 @@ impl Sender {
     ) {
         let mut state = self.shared.state_lock();
         let metrics = self.push_msg_encoded(&mut state, notification, slot_meta, data);
-        let mut to_wake: Vec<Waker> = Vec::new();
+        let mut to_wake: Vec<Waker> = Vec::with_capacity(state.wakers.len());
         state.wakers.retain(|(mask, waker)| {
             if mask.matches(notification) {
                 to_wake.push(waker.clone());

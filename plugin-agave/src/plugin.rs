@@ -46,10 +46,34 @@ pub struct OwnedUpdate {
     pub created_at: std::time::SystemTime,
     pub slot: solana_clock::Slot,
     pub payload: richat_proto::geyser::subscribe_update::UpdateOneof,
-    /// Only meaningful when notification == Slot
+    /// Only meaningful when `notification == PluginNotification::Slot`.
+    /// Maps to the integer value used in `push_msg_encoded` and `update_metrics`.
+    /// Must be 0 (zero-value) for all non-Slot messages.
     pub slot_status_i32: i32,
+    /// Only meaningful when `notification == PluginNotification::Slot`.
+    /// Must be `false` for all non-Slot messages.
     pub slot_confirmed: bool,
+    /// Only meaningful when `notification == PluginNotification::Slot`.
+    /// Must be `false` for all non-Slot messages.
     pub slot_finalized: bool,
+}
+
+pub(crate) const fn slot_status_fields(
+    status: &agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
+) -> (i32, bool, bool, richat_proto::geyser::SlotStatus) {
+    use {
+        agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
+        richat_proto::geyser::SlotStatus as ProtoSlotStatus,
+    };
+    match status {
+        SlotStatus::Processed           => (0, false, false, ProtoSlotStatus::SlotProcessed),
+        SlotStatus::Confirmed           => (1, true,  false, ProtoSlotStatus::SlotConfirmed),
+        SlotStatus::Rooted              => (2, true,  true,  ProtoSlotStatus::SlotFinalized),
+        SlotStatus::FirstShredReceived  => (3, false, false, ProtoSlotStatus::SlotFirstShredReceived),
+        SlotStatus::Completed           => (4, false, false, ProtoSlotStatus::SlotCompleted),
+        SlotStatus::CreatedBank         => (5, false, false, ProtoSlotStatus::SlotCreatedBank),
+        SlotStatus::Dead(_)             => (6, false, false, ProtoSlotStatus::SlotDead),
+    }
 }
 
 struct PluginTask(BoxFuture<'static, Result<(), JoinError>>);
@@ -297,16 +321,7 @@ impl GeyserPlugin for Plugin {
         parent: Option<u64>,
         status: &SlotStatus,
     ) -> PluginResult<()> {
-        use richat_proto::geyser::SlotStatus as ProtoSlotStatus;
-        let (status_i32, confirmed, finalized) = match status {
-            SlotStatus::Processed           => (0i32, false, false),
-            SlotStatus::Confirmed           => (1,    true,  false),
-            SlotStatus::Rooted              => (2,    true,  true),
-            SlotStatus::FirstShredReceived  => (3,    false, false),
-            SlotStatus::Completed           => (4,    false, false),
-            SlotStatus::CreatedBank         => (5,    false, false),
-            SlotStatus::Dead(_)             => (6,    false, false),
-        };
+        let (status_i32, confirmed, finalized, proto_status) = slot_status_fields(status);
         let inner = self.inner.as_ref().expect("initialized");
         inner.tx.send(OwnedUpdate {
             notification: PluginNotification::Slot,
@@ -316,15 +331,7 @@ impl GeyserPlugin for Plugin {
                 richat_proto::geyser::SubscribeUpdateSlot {
                     slot,
                     parent,
-                    status: match status {
-                        SlotStatus::Processed           => ProtoSlotStatus::SlotProcessed,
-                        SlotStatus::Confirmed           => ProtoSlotStatus::SlotConfirmed,
-                        SlotStatus::Rooted              => ProtoSlotStatus::SlotFinalized,
-                        SlotStatus::FirstShredReceived  => ProtoSlotStatus::SlotFirstShredReceived,
-                        SlotStatus::Completed           => ProtoSlotStatus::SlotCompleted,
-                        SlotStatus::CreatedBank         => ProtoSlotStatus::SlotCreatedBank,
-                        SlotStatus::Dead(_)             => ProtoSlotStatus::SlotDead,
-                    } as i32,
+                    status: proto_status as i32,
                     dead_error: if let SlotStatus::Dead(err) = status { Some(err.clone()) } else { None },
                 },
             ),
@@ -450,7 +457,7 @@ impl GeyserPlugin for Plugin {
 #[cfg(test)]
 mod tests {
     use {
-        super::{OwnedUpdate, PluginNotification},
+        super::{OwnedUpdate, PluginNotification, slot_status_fields},
         agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
         prost::Message,
         prost_types::Timestamp,
@@ -461,7 +468,7 @@ mod tests {
         richat_proto::{
             convert_to,
             geyser::{
-                SlotStatus as ProtoSlotStatus, SubscribeUpdate, SubscribeUpdateAccount,
+                SubscribeUpdate, SubscribeUpdateAccount,
                 SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
                 SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
                 subscribe_update::UpdateOneof,
@@ -602,15 +609,7 @@ mod tests {
         let created_at = SystemTime::now();
         for item in generate_slots() {
             let (slot, parent, status) = item.to_replica();
-            let (status_i32, confirmed, finalized) = match status {
-                SlotStatus::Processed           => (0i32, false, false),
-                SlotStatus::Confirmed           => (1,    true,  false),
-                SlotStatus::Rooted              => (2,    true,  true),
-                SlotStatus::FirstShredReceived  => (3,    false, false),
-                SlotStatus::Completed           => (4,    false, false),
-                SlotStatus::CreatedBank         => (5,    false, false),
-                SlotStatus::Dead(_)             => (6,    false, false),
-            };
+            let (status_i32, confirmed, finalized, proto_status) = slot_status_fields(status);
             let owned = OwnedUpdate {
                 notification: PluginNotification::Slot,
                 created_at,
@@ -618,15 +617,7 @@ mod tests {
                 payload: UpdateOneof::Slot(SubscribeUpdateSlot {
                     slot,
                     parent,
-                    status: match status {
-                        SlotStatus::Processed           => ProtoSlotStatus::SlotProcessed,
-                        SlotStatus::Confirmed           => ProtoSlotStatus::SlotConfirmed,
-                        SlotStatus::Rooted              => ProtoSlotStatus::SlotFinalized,
-                        SlotStatus::FirstShredReceived  => ProtoSlotStatus::SlotFirstShredReceived,
-                        SlotStatus::Completed           => ProtoSlotStatus::SlotCompleted,
-                        SlotStatus::CreatedBank         => ProtoSlotStatus::SlotCreatedBank,
-                        SlotStatus::Dead(_)             => ProtoSlotStatus::SlotDead,
-                    } as i32,
+                    status: proto_status as i32,
                     dead_error: if let SlotStatus::Dead(err) = status {
                         Some(err.clone())
                     } else {
