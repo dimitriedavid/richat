@@ -8,15 +8,14 @@ use {
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
     futures::stream::{Stream, StreamExt},
-    log::{debug, error},
+    log::debug,
     metrics_exporter_prometheus::PrometheusRecorder,
-    richat_metrics::{MaybeRecorder, counter, gauge},
+    richat_metrics::{MaybeRecorder, duration_to_seconds, gauge, histogram},
     richat_proto::richat::RichatFilter,
     richat_shared::{
         mutex_lock,
         transports::{RecvError, RecvItem, RecvStream, Subscribe, SubscribeError},
     },
-    smallvec::SmallVec,
     solana_clock::Slot,
     std::{
         collections::BTreeMap,
@@ -25,6 +24,7 @@ use {
         pin::Pin,
         sync::{Arc, Mutex, MutexGuard},
         task::{Context, Poll, Waker},
+        time::Instant,
     },
 };
 
@@ -64,68 +64,41 @@ impl Sender {
     }
 
     pub fn push(&self, message: ProtobufMessage, encoder: ProtobufEncoder) {
-        // encode message
+        let notification = PluginNotification::from(&message);
+
+        let encode_started = Instant::now();
         let data = message.encode(encoder);
+        histogram!(
+            &self.recorder,
+            metrics::CHANNEL_ENCODE_DURATION_SECONDS,
+            "notification" => notification.as_str()
+        )
+        .record(duration_to_seconds(encode_started.elapsed()));
 
-        // acquire state lock
+        let publish_started = Instant::now();
         let mut state = self.shared.state_lock();
-
-        // In March 2023 in Triton One we noticed that sometimes we do not receive
-        // slots with Confirmed status, I'm not sure that this still a case but for
-        // safety I added this hack
-        let slot_status = if let ProtobufMessage::Slot { slot, status, .. } = &message {
-            Some((*slot, *status))
-        } else {
-            None
-        };
-
-        let mut messages = SmallVec::<[(ProtobufMessage, Vec<u8>); 2]>::new();
-        messages.push((message, data));
-
-        if let Some((slot, status)) = slot_status {
-            let mut slots = SmallVec::<[Slot; 4]>::new();
-            slots.push(slot);
-
-            while let Some((parent, Some(entry))) = slots
-                .pop()
-                .and_then(|slot| state.slots.get(&slot))
-                .and_then(|entry| entry.parent_slot)
-                .map(|parent| (parent, state.slots.get_mut(&parent)))
-            {
-                if (*status == SlotStatus::Confirmed && !entry.confirmed)
-                    || (*status == SlotStatus::Rooted && !entry.finalized)
-                {
-                    slots.push(parent);
-
-                    let message = ProtobufMessage::Slot {
-                        slot: parent,
-                        parent: entry.parent_slot,
-                        status,
-                    };
-                    let data = message.encode(encoder);
-                    messages.push((message, data));
-
-                    error!("missed slot status update for {} ({:?})", parent, *status);
-                    if matches!(status, SlotStatus::Confirmed | SlotStatus::Rooted) {
-                        counter!(&self.recorder, metrics::GEYSER_MISSED_SLOT_STATUS, "status" => status.as_str())
-                            .increment(1);
-                    }
-                }
-            }
-        }
-
-        // push messages
-        for (message, data) in messages.into_iter().rev() {
-            self.push_msg(&mut state, message, data);
-        }
+        self.push_msg(&mut state, message, notification, data);
 
         // notify receivers
         for waker in state.wakers.drain(..) {
             waker.wake();
         }
+
+        histogram!(
+            &self.recorder,
+            metrics::CHANNEL_PUBLISH_DURATION_SECONDS,
+            "notification" => notification.as_str()
+        )
+        .record(duration_to_seconds(publish_started.elapsed()));
     }
 
-    fn push_msg(&self, state: &mut MutexGuard<'_, State>, message: ProtobufMessage, data: Vec<u8>) {
+    fn push_msg(
+        &self,
+        state: &mut MutexGuard<'_, State>,
+        message: ProtobufMessage,
+        notification: PluginNotification,
+        data: Vec<u8>,
+    ) {
         let mut removed_max_slot = None;
 
         // bump current tail
@@ -134,22 +107,7 @@ impl Sender {
         // update slots info
         let slot = message.get_slot();
         let head = state.tail;
-        let entry = state.slots.entry(slot).or_insert_with(|| SlotInfo {
-            head,
-            parent_slot: None,
-            confirmed: false,
-            finalized: false,
-        });
-        if let ProtobufMessage::Slot { parent, status, .. } = &message {
-            if let Some(parent) = parent {
-                entry.parent_slot = Some(*parent);
-            }
-            if **status == SlotStatus::Confirmed {
-                entry.confirmed = true;
-            } else if **status == SlotStatus::Rooted {
-                entry.finalized = true;
-            }
-        }
+        state.slots.entry(slot).or_insert_with(|| SlotInfo { head });
 
         // lock and update item
         state.bytes_total += data.len();
@@ -162,7 +120,7 @@ impl Sender {
         }
         item.pos = state.tail;
         item.slot = slot;
-        item.data = Some((PluginNotification::from(&message), Arc::new(data)));
+        item.data = Some((notification, Arc::new(data)));
         drop(item);
 
         // drop extra messages by max bytes
@@ -410,9 +368,6 @@ struct State {
 
 struct SlotInfo {
     head: u64,
-    parent_slot: Option<Slot>,
-    confirmed: bool,
-    finalized: bool,
 }
 
 struct Item {

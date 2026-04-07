@@ -42,6 +42,18 @@ impl From<&ProtobufMessage<'_>> for PluginNotification {
     }
 }
 
+impl PluginNotification {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slot => "slot",
+            Self::Account => "account",
+            Self::Transaction => "transaction",
+            Self::Entry => "entry",
+            Self::BlockMeta => "block_meta",
+        }
+    }
+}
+
 struct PluginTask(BoxFuture<'static, Result<(), JoinError>>);
 
 unsafe impl Sync for PluginTask {}
