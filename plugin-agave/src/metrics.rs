@@ -1,6 +1,8 @@
 use {
     crate::version::VERSION as VERSION_INFO,
-    metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder},
+    metrics_exporter_prometheus::{
+        Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+    },
     richat_metrics::{
         ConfigMetrics, Unit, counter, describe_counter, describe_gauge, describe_histogram,
     },
@@ -19,9 +21,42 @@ pub const CHANNEL_ENCODE_DURATION_MICROSECONDS: &str = "channel_encode_duration_
 pub const CHANNEL_PUBLISH_DURATION_MICROSECONDS: &str = "channel_publish_duration_microseconds"; // notification
 pub const CONNECTIONS_TOTAL: &str = "connections_total"; // transport
 
+const CHANNEL_DURATION_BUCKETS_MICROSECONDS: [f64; 19] = [
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    50.0,
+    100.0,
+    200.0,
+    500.0,
+    1_000.0,
+    2_000.0,
+    5_000.0,
+    10_000.0,
+    20_000.0,
+    50_000.0,
+    100_000.0,
+    200_000.0,
+    500_000.0,
+    1_000_000.0,
+];
+
 #[rustfmt::skip]
 pub fn setup() -> PrometheusRecorder {
-    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(CHANNEL_ENCODE_DURATION_MICROSECONDS.to_owned()),
+            &CHANNEL_DURATION_BUCKETS_MICROSECONDS,
+        )
+        .expect("channel encode histogram buckets should not be empty")
+        .set_buckets_for_metric(
+            Matcher::Full(CHANNEL_PUBLISH_DURATION_MICROSECONDS.to_owned()),
+            &CHANNEL_DURATION_BUCKETS_MICROSECONDS,
+        )
+        .expect("channel publish histogram buckets should not be empty")
+        .build_recorder();
 
     describe_counter!(recorder, "version", "Richat Plugin version info");
     counter!(
