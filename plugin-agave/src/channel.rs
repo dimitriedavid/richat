@@ -1,10 +1,6 @@
 // Based on https://github.com/tokio-rs/tokio/blob/master/tokio/src/sync/broadcast.rs
 use {
-    crate::{
-        config::ConfigChannel,
-        metrics,
-        plugin::PluginNotification,
-    },
+    crate::{config::ConfigChannel, metrics, plugin::PluginNotification},
     futures::stream::{Stream, StreamExt},
     log::debug,
     metrics_exporter_prometheus::PrometheusRecorder,
@@ -30,9 +26,8 @@ pub struct NotificationMask(u8);
 
 impl NotificationMask {
     /// Slot and BlockMeta are always delivered — cannot be filtered by subscribers.
-    pub const ALWAYS_ON: Self = Self(
-        PluginNotification::Slot.bit() | PluginNotification::BlockMeta.bit(),
-    );
+    pub const ALWAYS_ON: Self =
+        Self(PluginNotification::Slot.bit() | PluginNotification::BlockMeta.bit());
 
     pub const fn for_notification(n: PluginNotification) -> Self {
         Self(n.bit())
@@ -143,11 +138,14 @@ impl Sender {
 
         // update slots info
         let head = state.tail;
-        let entry = state.slots.entry(slot_meta.slot).or_insert_with(|| SlotInfo {
-            head,
-            confirmed: false,
-            finalized: false,
-        });
+        let entry = state
+            .slots
+            .entry(slot_meta.slot)
+            .or_insert_with(|| SlotInfo {
+                head,
+                confirmed: false,
+                finalized: false,
+            });
         if slot_meta.confirmed {
             entry.confirmed = true;
         }
@@ -202,7 +200,11 @@ impl Sender {
         let is_processed = is_slot && slot_meta.status_i32 == 0;
         PushMetrics {
             slot: slot_meta.slot,
-            slot_status: if is_slot { Some(slot_meta.status_i32) } else { None },
+            slot_status: if is_slot {
+                Some(slot_meta.status_i32)
+            } else {
+                None
+            },
             is_dead,
             is_processed,
             tail: state.tail,

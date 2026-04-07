@@ -14,6 +14,8 @@ pub const CHANNEL_MESSAGES_TOTAL: &str = "channel_messages_total";
 pub const CHANNEL_SLOTS_TOTAL: &str = "channel_slots_total";
 pub const CHANNEL_BYTES_TOTAL: &str = "channel_bytes_total";
 pub const CONNECTIONS_TOTAL: &str = "connections_total"; // transport
+pub const ENCODER_QUEUE_SIZE: &str = "encoder_queue_size";
+pub const ENCODER_QUEUE_FAILURE_TOTAL: &str = "encoder_queue_failure_total"; // notification, reason
 
 #[rustfmt::skip]
 pub fn setup() -> PrometheusRecorder {
@@ -38,6 +40,8 @@ pub fn setup() -> PrometheusRecorder {
     describe_gauge!(recorder, CHANNEL_SLOTS_TOTAL, "Total number of slots in channel");
     describe_gauge!(recorder, CHANNEL_BYTES_TOTAL, "Total size of all messages in channel");
     describe_gauge!(recorder, CONNECTIONS_TOTAL, "Total number of connections");
+    describe_gauge!(recorder, ENCODER_QUEUE_SIZE, "Number of owned updates waiting to be encoded");
+    describe_counter!(recorder, ENCODER_QUEUE_FAILURE_TOTAL, "Number of updates rejected because the encoder queue was closed");
 
     recorder
 }

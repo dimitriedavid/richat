@@ -58,6 +58,8 @@ pub struct ConfigChannel {
     pub max_messages: usize,
     #[serde(deserialize_with = "deserialize_humansize_usize")]
     pub max_bytes: usize,
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub encoder_queue_size: usize,
 }
 
 impl Default for ConfigChannel {
@@ -65,6 +67,7 @@ impl Default for ConfigChannel {
         Self {
             max_messages: 2_097_152, // aligned to power of 2, ~20k/slot should give us ~100 slots
             max_bytes: 15 * 1024 * 1024 * 1024, // 15GiB with ~150MiB/slot should give us ~100 slots
+            encoder_queue_size: 8_192,
         }
     }
 }

@@ -8,7 +8,7 @@ Four independent improvements to the Geyser plugin, shipped together because the
 
 **Before:** Every geyser callback (`notify_transaction`, `update_account`, etc.) called `Sender::push()` synchronously, which serialized the message to protobuf bytes before returning. For a complex transaction with inner instructions, token balances and address lookups this is a non-trivial amount of CPU work happening on the validator's own thread, blocking it from processing the next item.
 
-**After:** Each callback clones the relevant data into an owned struct (`OwnedUpdate`) and sends it via a `tokio::sync::mpsc::unbounded_channel`. The callback returns immediately. A single background Tokio task drains the channel, calls `SubscribeUpdate::encode_to_vec()`, and pushes the encoded bytes into the ring buffer.
+**After:** Each callback clones the relevant data into an owned struct (`OwnedUpdate`) and sends it via a bounded Tokio channel. In the normal case the callback returns immediately. A single background Tokio task drains the queue, calls `SubscribeUpdate::encode_to_vec()`, and pushes the encoded bytes into the ring buffer. If the queue is full, the callback blocks until there is capacity again, applying backpressure instead of growing memory without bound.
 
 The clone is unavoidable — `ProtobufMessage<'a>` borrowed validator-owned memory, so to hand off to another thread you must own the data. The cost of the clone is roughly the same as the cost of encoding (both walk the full transaction), so total CPU work is similar; the difference is it no longer happens on the validator thread.
 
@@ -16,9 +16,9 @@ The clone is unavoidable — `ProtobufMessage<'a>` borrowed validator-owned memo
 
 **Before:** There were two encoding paths selectable via `config.channel.encoder`: a custom zero-copy raw encoder (`"raw"`, the default) and standard prost (`"prost"`). The raw encoder's advantage was that it encoded directly from borrowed Geyser data without allocating intermediate structs — two passes (size calculation + encode) but no intermediate allocation.
 
-**After:** Only prost. `SubscribeUpdate::encode_to_vec()` does a single pass with dynamic allocation.
+**After:** Only prost. `SubscribeUpdate::encode_to_vec()` is the only encoding path.
 
-**Why:** The raw encoder's zero-copy advantage only existed when encoding happened on the validator thread directly from borrowed data. Once encoding moves to a background task, you must clone the data first regardless. That clone already allocates the owned prost structs (`OwnedUpdate` carries `UpdateOneof` which is prost-generated). At that point `encode_to_vec()` is a single-pass write into a growing `Vec<u8>` — simpler and equally fast. The raw encoder's double-traversal (size pass + encode pass) was strictly worse.
+**Why:** The raw encoder's zero-copy advantage only existed when encoding happened on the validator thread directly from borrowed data. Once encoding moves off-thread, you must clone the data first regardless. That clone already allocates the owned prost structs (`OwnedUpdate` carries `UpdateOneof` which is prost-generated). `encode_to_vec()` still computes `encoded_len()` before writing, but it keeps the codepath simple and reuses the prost-generated types we already cloned into.
 
 The encoding tests (`test_encode_*`) verify byte-for-byte that the new prost path produces identical output to what the raw encoder produced. No subscriber-visible change in wire format.
 
@@ -58,8 +58,8 @@ The `protobuf` module (`ProtobufMessage`, `ProtobufEncoder`, and all encoding he
 
 ## What we gain
 
-- **Validator thread unblocked.** The plugin's per-callback cost is now: a few `to_vec()` calls for pubkeys/data, one prost struct construction, one channel send. No lock acquisition, no protobuf serialisation.
-- **Single-pass encoding.** `encode_to_vec()` replaces the raw encoder's two-pass size-then-encode loop.
+- **Validator thread usually unblocked.** The normal per-callback cost is now: a few `to_vec()` calls for pubkeys/data, one prost struct construction, one bounded channel send. If the queue fills, the callback blocks until the encoder catches up.
+- **Bounded pre-encode memory.** Owned updates waiting for background encoding are now capped by `channel.encoder_queue_size`.
 - **Shorter lock hold time.** State mutex is held only for ring buffer and slot map operations. Metrics writes happen outside.
 - **Less spurious wakeups.** Transaction-only subscribers are no longer woken by account and entry pushes.
 - **Less code.** Deleted: `plugin-agave/src/protobuf/` (entire module), `plugin-agave/fuzz/` (all fuzz targets), ~200 lines from `channel.rs`, `--no-verify` CLI path. Net: significant reduction in total lines.

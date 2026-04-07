@@ -11,7 +11,7 @@ use {
         quic::{QuicClient, QuicClientBuilder},
     },
     richat_proto::{
-        geyser::{SubscribeUpdate},
+        geyser::SubscribeUpdate,
         richat::{GrpcSubscribeRequest, RichatFilter},
     },
     richat_shared::transports::{grpc::ConfigGrpcServer, quic::ConfigQuicServer},
@@ -304,4 +304,3 @@ impl ArgsAppStreamGrpc {
         Ok(stream.map_err(Into::into).boxed())
     }
 }
-

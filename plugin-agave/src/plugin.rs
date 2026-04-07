@@ -1,10 +1,5 @@
 use {
-    crate::{
-        channel::Sender,
-        config::Config,
-        metrics,
-        version::VERSION,
-    },
+    crate::{channel::Sender, config::Config, metrics, version::VERSION},
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
         ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
@@ -12,10 +7,11 @@ use {
     },
     futures::future::BoxFuture,
     log::error,
-    richat_metrics::{MaybeRecorder, gauge},
+    metrics_exporter_prometheus::PrometheusRecorder,
+    richat_metrics::{MaybeRecorder, counter, gauge},
     richat_shared::transports::{grpc::GrpcServer, quic::QuicServer},
     solana_clock::Slot,
-    std::{fmt, sync::Arc, time::Duration},
+    std::{fmt, io, sync::Arc, time::Duration},
     tokio::{runtime::Runtime, task::JoinError},
     tokio_util::sync::CancellationToken,
 };
@@ -32,11 +28,21 @@ pub enum PluginNotification {
 impl PluginNotification {
     pub const fn bit(self) -> u8 {
         match self {
-            Self::Slot        => 1 << 0,
-            Self::Account     => 1 << 1,
+            Self::Slot => 1 << 0,
+            Self::Account => 1 << 1,
             Self::Transaction => 1 << 2,
-            Self::Entry       => 1 << 3,
-            Self::BlockMeta   => 1 << 4,
+            Self::Entry => 1 << 3,
+            Self::BlockMeta => 1 << 4,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slot => "slot",
+            Self::Account => "account",
+            Self::Transaction => "transaction",
+            Self::Entry => "entry",
+            Self::BlockMeta => "block_meta",
         }
     }
 }
@@ -66,13 +72,64 @@ pub(crate) const fn slot_status_fields(
         richat_proto::geyser::SlotStatus as ProtoSlotStatus,
     };
     match status {
-        SlotStatus::Processed           => (0, false, false, ProtoSlotStatus::SlotProcessed),
-        SlotStatus::Confirmed           => (1, true,  false, ProtoSlotStatus::SlotConfirmed),
-        SlotStatus::Rooted              => (2, true,  true,  ProtoSlotStatus::SlotFinalized),
-        SlotStatus::FirstShredReceived  => (3, false, false, ProtoSlotStatus::SlotFirstShredReceived),
-        SlotStatus::Completed           => (4, false, false, ProtoSlotStatus::SlotCompleted),
-        SlotStatus::CreatedBank         => (5, false, false, ProtoSlotStatus::SlotCreatedBank),
-        SlotStatus::Dead(_)             => (6, false, false, ProtoSlotStatus::SlotDead),
+        SlotStatus::Processed => (0, false, false, ProtoSlotStatus::SlotProcessed),
+        SlotStatus::Confirmed => (1, true, false, ProtoSlotStatus::SlotConfirmed),
+        SlotStatus::Rooted => (2, true, true, ProtoSlotStatus::SlotFinalized),
+        SlotStatus::FirstShredReceived => {
+            (3, false, false, ProtoSlotStatus::SlotFirstShredReceived)
+        }
+        SlotStatus::Completed => (4, false, false, ProtoSlotStatus::SlotCompleted),
+        SlotStatus::CreatedBank => (5, false, false, ProtoSlotStatus::SlotCreatedBank),
+        SlotStatus::Dead(_) => (6, false, false, ProtoSlotStatus::SlotDead),
+    }
+}
+
+#[derive(Debug)]
+struct EncoderState {
+    messages: Sender,
+    recorder: Arc<MaybeRecorder<PrometheusRecorder>>,
+}
+
+#[derive(Clone)]
+struct EncoderQueue {
+    tx: tokio::sync::mpsc::Sender<OwnedUpdate>,
+    capacity: usize,
+    state: Arc<EncoderState>,
+}
+
+impl fmt::Debug for EncoderQueue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncoderQueue")
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+impl EncoderQueue {
+    fn update_queue_metric(&self) {
+        let queued = self.tx.max_capacity().saturating_sub(self.tx.capacity());
+        gauge!(&self.state.recorder, metrics::ENCODER_QUEUE_SIZE).set(queued as f64);
+    }
+
+    fn push(&self, owned: OwnedUpdate) -> PluginResult<()> {
+        if let Err(error) = self.tx.blocking_send(owned) {
+            counter!(
+                &self.state.recorder,
+                metrics::ENCODER_QUEUE_FAILURE_TOTAL,
+                "notification" => error.0.notification.as_str(),
+                "reason" => "closed"
+            )
+            .increment(1);
+            return Err(GeyserPluginError::Custom(Box::new(io::Error::other(
+                format!(
+                    "encoder queue is closed; failed to process {} update for slot {}",
+                    error.0.notification.as_str(),
+                    error.0.slot
+                ),
+            ))));
+        }
+        self.update_queue_metric();
+        Ok(())
     }
 }
 
@@ -87,48 +144,49 @@ impl fmt::Debug for PluginTask {
 }
 
 async fn encoder_task(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<OwnedUpdate>,
-    sender: crate::channel::Sender,
+    mut rx: tokio::sync::mpsc::Receiver<OwnedUpdate>,
+    state: Arc<EncoderState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    use {prost::Message, prost_types::Timestamp, richat_proto::geyser::SubscribeUpdate, std::sync::Arc};
+    use {
+        prost::Message, prost_types::Timestamp, richat_proto::geyser::SubscribeUpdate,
+        std::sync::Arc,
+    };
 
     loop {
         tokio::select! {
             biased;
-            Some(owned) = rx.recv() => {
-                let notification = owned.notification;
-                let slot = owned.slot;
-                let slot_status_i32 = owned.slot_status_i32;
-                let slot_confirmed = owned.slot_confirmed;
-                let slot_finalized = owned.slot_finalized;
-                let bytes = SubscribeUpdate {
-                    filters: vec![],
-                    update_oneof: Some(owned.payload),
-                    created_at: Some(Timestamp::from(owned.created_at)),
-                }
-                .encode_to_vec();
-                sender.push_encoded(
-                    notification,
-                    crate::channel::SlotMeta {
-                        slot,
-                        status_i32: slot_status_i32,
-                        confirmed: slot_confirmed,
-                        finalized: slot_finalized,
-                    },
-                    Arc::new(bytes),
-                );
-            }
             _ = shutdown.cancelled() => break,
+            maybe_owned = rx.recv() => match maybe_owned {
+                Some(owned) => {
+                    let notification = owned.notification;
+                    let slot_meta = crate::channel::SlotMeta {
+                        slot: owned.slot,
+                        status_i32: owned.slot_status_i32,
+                        confirmed: owned.slot_confirmed,
+                        finalized: owned.slot_finalized,
+                    };
+                    let bytes = SubscribeUpdate {
+                        filters: vec![],
+                        update_oneof: Some(owned.payload),
+                        created_at: Some(Timestamp::from(owned.created_at)),
+                    }
+                    .encode_to_vec();
+                    state.messages.push_encoded(notification, slot_meta, Arc::new(bytes));
+                    gauge!(&state.recorder, metrics::ENCODER_QUEUE_SIZE).set(rx.len() as f64);
+                }
+                None => break,
+            }
         }
     }
+    gauge!(&state.recorder, metrics::ENCODER_QUEUE_SIZE).set(0.0);
 }
 
 #[derive(Debug)]
 pub struct PluginInner {
     runtime: Runtime,
     messages: Sender,
-    tx: tokio::sync::mpsc::UnboundedSender<OwnedUpdate>,
+    encoder: EncoderQueue,
     shutdown: CancellationToken,
     tasks: Vec<(&'static str, PluginTask)>,
 }
@@ -153,19 +211,28 @@ impl PluginInner {
         let messages = Sender::new(config.channel, Arc::clone(&metrics_recorder));
 
         // Spawn servers
-        let (messages, tx, shutdown, tasks) = runtime
+        let (messages, encoder, shutdown, tasks) = runtime
             .block_on(async move {
                 let shutdown = CancellationToken::new();
                 let mut tasks = Vec::with_capacity(4);
+                let encoder_state = Arc::new(EncoderState {
+                    messages: messages.clone(),
+                    recorder: Arc::clone(&metrics_recorder),
+                });
+                let encoder_queue_size = config.channel.encoder_queue_size.max(1);
 
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OwnedUpdate>();
-                let encoder_sender = messages.clone();
+                let (tx, rx) = tokio::sync::mpsc::channel::<OwnedUpdate>(encoder_queue_size);
                 tasks.push((
                     "Encoder Task",
                     PluginTask(Box::pin(
-                        tokio::spawn(encoder_task(rx, encoder_sender, shutdown.clone()))
+                        tokio::spawn(encoder_task(rx, Arc::clone(&encoder_state), shutdown.clone()))
                     )),
                 ));
+                let encoder = EncoderQueue {
+                    tx,
+                    capacity: encoder_queue_size,
+                    state: encoder_state,
+                };
 
                 // Start gRPC
                 if let Some(config) = config.grpc {
@@ -217,14 +284,14 @@ impl PluginInner {
                     ));
                 }
 
-                Ok::<_, anyhow::Error>((messages, tx, shutdown, tasks))
+                Ok::<_, anyhow::Error>((messages, encoder, shutdown, tasks))
             })
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
 
         Ok(Self {
             runtime,
             messages,
-            tx,
+            encoder,
             shutdown,
             tasks,
         })
@@ -260,30 +327,47 @@ impl GeyserPlugin for Plugin {
 
     fn on_unload(&mut self) {
         if let Some(inner) = self.inner.take() {
-            inner.messages.close();
+            let PluginInner {
+                runtime,
+                messages,
+                encoder,
+                shutdown,
+                tasks,
+            } = inner;
 
-            inner.shutdown.cancel();
-            inner.runtime.block_on(async {
-                for (name, task) in inner.tasks {
+            messages.close();
+            drop(encoder);
+            shutdown.cancel();
+            runtime.block_on(async {
+                for (name, task) in tasks {
                     if let Err(error) = task.0.await {
                         error!("failed to join `{name}` task: {error:?}");
                     }
                 }
             });
 
-            inner.runtime.shutdown_timeout(Duration::from_secs(10));
+            runtime.shutdown_timeout(Duration::from_secs(10));
         }
     }
 
-    fn update_account(&self, account: ReplicaAccountInfoVersions, slot: u64, is_startup: bool) -> PluginResult<()> {
+    fn update_account(
+        &self,
+        account: ReplicaAccountInfoVersions,
+        slot: u64,
+        is_startup: bool,
+    ) -> PluginResult<()> {
         if !is_startup {
             let account = match account {
-                ReplicaAccountInfoVersions::V0_0_1(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported"),
-                ReplicaAccountInfoVersions::V0_0_2(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported"),
+                ReplicaAccountInfoVersions::V0_0_1(_) => {
+                    unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
+                }
+                ReplicaAccountInfoVersions::V0_0_2(_) => {
+                    unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
+                }
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
             let inner = self.inner.as_ref().expect("initialized");
-            inner.tx.send(OwnedUpdate {
+            inner.encoder.push(OwnedUpdate {
                 notification: PluginNotification::Account,
                 created_at: std::time::SystemTime::now(),
                 slot,
@@ -297,7 +381,10 @@ impl GeyserPlugin for Plugin {
                             rent_epoch: account.rent_epoch,
                             data: account.data.to_vec(),
                             write_version: account.write_version,
-                            txn_signature: account.txn.as_ref().map(|txn| txn.signature().as_ref().to_vec()),
+                            txn_signature: account
+                                .txn
+                                .as_ref()
+                                .map(|txn| txn.signature().as_ref().to_vec()),
                         }),
                         slot,
                         is_startup: false,
@@ -306,7 +393,7 @@ impl GeyserPlugin for Plugin {
                 slot_status_i32: 0,
                 slot_confirmed: false,
                 slot_finalized: false,
-            }).ok();
+            })?;
         }
         Ok(())
     }
@@ -323,7 +410,7 @@ impl GeyserPlugin for Plugin {
     ) -> PluginResult<()> {
         let (status_i32, confirmed, finalized, proto_status) = slot_status_fields(status);
         let inner = self.inner.as_ref().expect("initialized");
-        inner.tx.send(OwnedUpdate {
+        inner.encoder.push(OwnedUpdate {
             notification: PluginNotification::Slot,
             created_at: std::time::SystemTime::now(),
             slot,
@@ -332,13 +419,17 @@ impl GeyserPlugin for Plugin {
                     slot,
                     parent,
                     status: proto_status as i32,
-                    dead_error: if let SlotStatus::Dead(err) = status { Some(err.clone()) } else { None },
+                    dead_error: if let SlotStatus::Dead(err) = status {
+                        Some(err.clone())
+                    } else {
+                        None
+                    },
                 },
             ),
             slot_status_i32: status_i32,
             slot_confirmed: confirmed,
             slot_finalized: finalized,
-        }).ok();
+        })?;
         Ok(())
     }
 
@@ -349,12 +440,16 @@ impl GeyserPlugin for Plugin {
     ) -> PluginResult<()> {
         use richat_proto::convert_to;
         let transaction = match transaction {
-            ReplicaTransactionInfoVersions::V0_0_1(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported"),
-            ReplicaTransactionInfoVersions::V0_0_2(_) => unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported"),
+            ReplicaTransactionInfoVersions::V0_0_1(_) => {
+                unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
+            }
+            ReplicaTransactionInfoVersions::V0_0_2(_) => {
+                unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
+            }
             ReplicaTransactionInfoVersions::V0_0_3(info) => info,
         };
         let inner = self.inner.as_ref().expect("initialized");
-        inner.tx.send(OwnedUpdate {
+        inner.encoder.push(OwnedUpdate {
             notification: PluginNotification::Transaction,
             created_at: std::time::SystemTime::now(),
             slot,
@@ -364,7 +459,9 @@ impl GeyserPlugin for Plugin {
                         signature: transaction.signature.as_ref().to_vec(),
                         is_vote: transaction.is_vote,
                         transaction: Some(convert_to::create_transaction(transaction.transaction)),
-                        meta: Some(convert_to::create_transaction_meta(transaction.transaction_status_meta)),
+                        meta: Some(convert_to::create_transaction_meta(
+                            transaction.transaction_status_meta,
+                        )),
                         index: transaction.index as u64,
                     }),
                     slot,
@@ -373,17 +470,19 @@ impl GeyserPlugin for Plugin {
             slot_status_i32: 0,
             slot_confirmed: false,
             slot_finalized: false,
-        }).ok();
+        })?;
         Ok(())
     }
 
     fn notify_entry(&self, entry: ReplicaEntryInfoVersions) -> PluginResult<()> {
         let entry = match entry {
-            ReplicaEntryInfoVersions::V0_0_1(_) => unreachable!("ReplicaEntryInfoVersions::V0_0_1 is not supported"),
+            ReplicaEntryInfoVersions::V0_0_1(_) => {
+                unreachable!("ReplicaEntryInfoVersions::V0_0_1 is not supported")
+            }
             ReplicaEntryInfoVersions::V0_0_2(e) => e,
         };
         let inner = self.inner.as_ref().expect("initialized");
-        inner.tx.send(OwnedUpdate {
+        inner.encoder.push(OwnedUpdate {
             notification: PluginNotification::Entry,
             created_at: std::time::SystemTime::now(),
             slot: entry.slot,
@@ -400,20 +499,26 @@ impl GeyserPlugin for Plugin {
             slot_status_i32: 0,
             slot_confirmed: false,
             slot_finalized: false,
-        }).ok();
+        })?;
         Ok(())
     }
 
     fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions<'_>) -> PluginResult<()> {
         use richat_proto::convert_to;
         let blockinfo = match blockinfo {
-            ReplicaBlockInfoVersions::V0_0_1(_) => unreachable!("ReplicaBlockInfoVersions::V0_0_1 is not supported"),
-            ReplicaBlockInfoVersions::V0_0_2(_) => unreachable!("ReplicaBlockInfoVersions::V0_0_2 is not supported"),
-            ReplicaBlockInfoVersions::V0_0_3(_) => unreachable!("ReplicaBlockInfoVersions::V0_0_3 is not supported"),
+            ReplicaBlockInfoVersions::V0_0_1(_) => {
+                unreachable!("ReplicaBlockInfoVersions::V0_0_1 is not supported")
+            }
+            ReplicaBlockInfoVersions::V0_0_2(_) => {
+                unreachable!("ReplicaBlockInfoVersions::V0_0_2 is not supported")
+            }
+            ReplicaBlockInfoVersions::V0_0_3(_) => {
+                unreachable!("ReplicaBlockInfoVersions::V0_0_3 is not supported")
+            }
             ReplicaBlockInfoVersions::V0_0_4(info) => info,
         };
         let inner = self.inner.as_ref().expect("initialized");
-        inner.tx.send(OwnedUpdate {
+        inner.encoder.push(OwnedUpdate {
             notification: PluginNotification::BlockMeta,
             created_at: std::time::SystemTime::now(),
             slot: blockinfo.slot,
@@ -421,7 +526,10 @@ impl GeyserPlugin for Plugin {
                 richat_proto::geyser::SubscribeUpdateBlockMeta {
                     slot: blockinfo.slot,
                     blockhash: blockinfo.blockhash.to_string(),
-                    rewards: Some(convert_to::create_rewards_obj(&blockinfo.rewards.rewards, blockinfo.rewards.num_partitions)),
+                    rewards: Some(convert_to::create_rewards_obj(
+                        &blockinfo.rewards.rewards,
+                        blockinfo.rewards.num_partitions,
+                    )),
                     block_time: blockinfo.block_time.map(convert_to::create_timestamp),
                     block_height: blockinfo.block_height.map(convert_to::create_block_height),
                     parent_slot: blockinfo.parent_slot,
@@ -433,7 +541,7 @@ impl GeyserPlugin for Plugin {
             slot_status_i32: 0,
             slot_confirmed: false,
             slot_finalized: false,
-        }).ok();
+        })?;
         Ok(())
     }
 
@@ -457,24 +565,36 @@ impl GeyserPlugin for Plugin {
 #[cfg(test)]
 mod tests {
     use {
-        super::{OwnedUpdate, PluginNotification, slot_status_fields},
+        super::{
+            EncoderQueue, EncoderState, OwnedUpdate, PluginNotification, encoder_task,
+            slot_status_fields,
+        },
+        crate::channel::Sender,
         agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus,
+        metrics_exporter_prometheus::PrometheusRecorder,
         prost::Message,
         prost_types::Timestamp,
         richat_benches::fixtures::{
             generate_accounts, generate_block_metas, generate_entries, generate_slots,
             generate_transactions,
         },
+        richat_metrics::MaybeRecorder,
         richat_proto::{
             convert_to,
             geyser::{
-                SubscribeUpdate, SubscribeUpdateAccount,
-                SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
-                SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+                SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
+                SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot,
+                SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
                 subscribe_update::UpdateOneof,
             },
         },
-        std::time::SystemTime,
+        richat_shared::transports::Subscribe,
+        std::{
+            sync::{Arc, mpsc as std_mpsc},
+            thread,
+            time::{Duration, SystemTime},
+        },
+        tokio_util::sync::CancellationToken,
     };
 
     fn encode_owned(payload: UpdateOneof, created_at: SystemTime) -> Vec<u8> {
@@ -484,6 +604,23 @@ mod tests {
             created_at: Some(Timestamp::from(created_at)),
         }
         .encode_to_vec()
+    }
+
+    fn sample_slot_update(slot: u64) -> OwnedUpdate {
+        OwnedUpdate {
+            notification: PluginNotification::Slot,
+            created_at: SystemTime::UNIX_EPOCH,
+            slot,
+            payload: UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                parent: slot.checked_sub(1),
+                status: richat_proto::geyser::SlotStatus::SlotProcessed as i32,
+                dead_error: None,
+            }),
+            slot_status_i32: 0,
+            slot_confirmed: false,
+            slot_finalized: false,
+        }
     }
 
     #[test]
@@ -681,6 +818,125 @@ mod tests {
                 "block_meta: {item:?}"
             );
         }
+    }
+
+    #[test]
+    fn encoder_queue_blocks_when_full_until_capacity_is_available() {
+        let messages = Sender::new(
+            crate::config::ConfigChannel {
+                max_messages: 16,
+                max_bytes: 1024 * 1024,
+                encoder_queue_size: 1,
+            },
+            Arc::new(MaybeRecorder::<PrometheusRecorder>::Noop),
+        );
+        let state = Arc::new(EncoderState {
+            messages: messages.clone(),
+            recorder: Arc::new(MaybeRecorder::<PrometheusRecorder>::Noop),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(sample_slot_update(10)).unwrap();
+        let queue = EncoderQueue {
+            tx,
+            capacity: 1,
+            state,
+        };
+        let (done_tx, done_rx) = std_mpsc::channel();
+
+        thread::spawn(move || {
+            queue.push(sample_slot_update(11)).unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "push should block while the queue is full"
+        );
+
+        let first = rx.blocking_recv().unwrap();
+        assert_eq!(first.slot, 10);
+
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = rx.blocking_recv().unwrap();
+        assert_eq!(second.slot, 11);
+    }
+
+    #[test]
+    fn encoder_queue_returns_error_when_closed() {
+        let messages = Sender::new(
+            crate::config::ConfigChannel {
+                max_messages: 16,
+                max_bytes: 1024 * 1024,
+                encoder_queue_size: 1,
+            },
+            Arc::new(MaybeRecorder::<PrometheusRecorder>::Noop),
+        );
+        let state = Arc::new(EncoderState {
+            messages,
+            recorder: Arc::new(MaybeRecorder::<PrometheusRecorder>::Noop),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let queue = EncoderQueue {
+            tx,
+            capacity: 1,
+            state,
+        };
+
+        let error = queue.push(sample_slot_update(12)).unwrap_err();
+        assert!(format!("{error}").contains("encoder queue is closed"));
+    }
+
+    #[tokio::test]
+    async fn encoder_task_stops_on_shutdown_without_draining_backlog() {
+        let messages = Sender::new(
+            crate::config::ConfigChannel {
+                max_messages: 16,
+                max_bytes: 1024 * 1024,
+                encoder_queue_size: 1,
+            },
+            Arc::new(MaybeRecorder::<PrometheusRecorder>::Noop),
+        );
+        let state = Arc::new(EncoderState {
+            messages: messages.clone(),
+            recorder: Arc::new(MaybeRecorder::<PrometheusRecorder>::Noop),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(sample_slot_update(13)).unwrap();
+        drop(tx);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        encoder_task(rx, Arc::clone(&state), shutdown).await;
+
+        assert!(messages.subscribe(Some(13), None).is_err());
+    }
+
+    #[test]
+    fn encode_owned_update_keeps_slot_metadata() {
+        let owned = sample_slot_update(14);
+        let notification = owned.notification;
+        let slot_meta = crate::channel::SlotMeta {
+            slot: owned.slot,
+            status_i32: owned.slot_status_i32,
+            confirmed: owned.slot_confirmed,
+            finalized: owned.slot_finalized,
+        };
+        let bytes = SubscribeUpdate {
+            filters: vec![],
+            update_oneof: Some(owned.payload),
+            created_at: Some(Timestamp::from(owned.created_at)),
+        }
+        .encode_to_vec();
+        assert_eq!(notification, PluginNotification::Slot);
+        assert_eq!(slot_meta.slot, 14);
+        assert_eq!(slot_meta.status_i32, 0);
+        let decoded = SubscribeUpdate::decode(bytes.as_slice()).unwrap();
+        let Some(UpdateOneof::Slot(slot)) = decoded.update_oneof else {
+            panic!("expected slot update");
+        };
+        assert_eq!(slot.slot, 14);
     }
 }
 
