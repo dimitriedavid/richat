@@ -10,7 +10,7 @@ use {
     futures::stream::{Stream, StreamExt},
     log::debug,
     metrics_exporter_prometheus::PrometheusRecorder,
-    richat_metrics::{MaybeRecorder, duration_to_seconds, gauge, histogram},
+    richat_metrics::{MaybeRecorder, gauge, histogram},
     richat_proto::richat::RichatFilter,
     richat_shared::{
         mutex_lock,
@@ -70,10 +70,10 @@ impl Sender {
         let data = message.encode(encoder);
         histogram!(
             &self.recorder,
-            metrics::CHANNEL_ENCODE_DURATION_SECONDS,
+            metrics::CHANNEL_ENCODE_DURATION_MICROSECONDS,
             "notification" => notification.as_str()
         )
-        .record(duration_to_seconds(encode_started.elapsed()));
+        .record(encode_started.elapsed().as_micros() as f64);
 
         let publish_started = Instant::now();
         let mut state = self.shared.state_lock();
@@ -86,10 +86,10 @@ impl Sender {
 
         histogram!(
             &self.recorder,
-            metrics::CHANNEL_PUBLISH_DURATION_SECONDS,
+            metrics::CHANNEL_PUBLISH_DURATION_MICROSECONDS,
             "notification" => notification.as_str()
         )
-        .record(duration_to_seconds(publish_started.elapsed()));
+        .record(publish_started.elapsed().as_micros() as f64);
     }
 
     fn push_msg(

@@ -15,8 +15,8 @@ pub const GEYSER_SLOT_STATUS: &str = "geyser_slot_status"; // status
 pub const CHANNEL_MESSAGES_TOTAL: &str = "channel_messages_total";
 pub const CHANNEL_SLOTS_TOTAL: &str = "channel_slots_total";
 pub const CHANNEL_BYTES_TOTAL: &str = "channel_bytes_total";
-pub const CHANNEL_ENCODE_DURATION_SECONDS: &str = "channel_encode_duration_seconds"; // notification
-pub const CHANNEL_PUBLISH_DURATION_SECONDS: &str = "channel_publish_duration_seconds"; // notification
+pub const CHANNEL_ENCODE_DURATION_MICROSECONDS: &str = "channel_encode_duration_microseconds"; // notification
+pub const CHANNEL_PUBLISH_DURATION_MICROSECONDS: &str = "channel_publish_duration_microseconds"; // notification
 pub const CONNECTIONS_TOTAL: &str = "connections_total"; // transport
 
 #[rustfmt::skip]
@@ -41,8 +41,8 @@ pub fn setup() -> PrometheusRecorder {
     describe_gauge!(recorder, CHANNEL_MESSAGES_TOTAL, "Total number of messages in channel");
     describe_gauge!(recorder, CHANNEL_SLOTS_TOTAL, "Total number of slots in channel");
     describe_gauge!(recorder, CHANNEL_BYTES_TOTAL, "Total size of all messages in channel");
-    describe_histogram!(recorder, CHANNEL_ENCODE_DURATION_SECONDS, Unit::Seconds, "Time spent encoding a Geyser update before publishing it into the in-memory channel");
-    describe_histogram!(recorder, CHANNEL_PUBLISH_DURATION_SECONDS, Unit::Seconds, "Time spent publishing an encoded Geyser update into the in-memory channel and waking subscribers");
+    describe_histogram!(recorder, CHANNEL_ENCODE_DURATION_MICROSECONDS, Unit::Microseconds, "Time spent encoding a Geyser update before publishing it into the in-memory channel");
+    describe_histogram!(recorder, CHANNEL_PUBLISH_DURATION_MICROSECONDS, Unit::Microseconds, "Time spent publishing an encoded Geyser update into the in-memory channel and waking subscribers");
     describe_gauge!(recorder, CONNECTIONS_TOTAL, "Total number of connections");
 
     recorder
